@@ -1,0 +1,65 @@
+=== COACTUPC ===
+ - READ -> ERROR-OPNAME
+ - READ -> ERROR-OPNAME
+ - READ -> ERROR-OPNAME
+ - UNEXPECTED ABEND OCCURRED. -> ABEND-MSG
+
+=== COACTVWC ===
+ - READ -> ERROR-OPNAME
+ - READ -> ERROR-OPNAME
+ - READ -> ERROR-OPNAME
+ - UNEXPECTED ABEND OCCURRED. -> ABEND-MSG
+
+=== COADM01C ===
+ - <no direct literal error/message moves found>
+
+=== COBIL00C ===
+ - <no direct literal error/message moves found>
+
+=== COCRDLIC ===
+ - READ -> ERROR-OPNAME
+ - NO MORE RECORDS TO SHOW -> WS-ERROR-MSG
+ - NO RECORDS TO SHOW -> WS-ERROR-MSG
+ - READ -> ERROR-OPNAME
+ - READ -> ERROR-OPNAME
+ - READ -> ERROR-OPNAME
+
+=== COCRDSLC ===
+ - READ -> ERROR-OPNAME
+ - READ -> ERROR-OPNAME
+ - UNEXPECTED ABEND OCCURRED. -> ABEND-MSG
+
+=== COCRDUPC ===
+ - READ -> ERROR-OPNAME
+ - UNEXPECTED ABEND OCCURRED. -> ABEND-MSG
+
+=== COMEN01C ===
+ - <no direct literal error/message moves found>
+
+=== CORPT00C ===
+ - <no direct literal error/message moves found>
+
+=== COSGN00C ===
+ - <no direct literal error/message moves found>
+
+=== COTRN00C ===
+ - <no direct literal error/message moves found>
+
+=== COTRN01C ===
+ - <no direct literal error/message moves found>
+
+=== COTRN02C ===
+ - <no direct literal error/message moves found>
+
+=== COUSR00C ===
+ - <no direct literal error/message moves found>
+
+=== COUSR01C ===
+ - <no direct literal error/message moves found>
+
+=== COUSR02C ===
+ - <no direct literal error/message moves found>
+
+=== COUSR03C ===
+ - <no direct literal error/message moves found>
+

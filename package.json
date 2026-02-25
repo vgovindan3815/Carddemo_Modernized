@@ -1,0 +1,25 @@
+{
+  "name": "carddemo-modernized-app",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "concurrently \"npm --prefix backend run dev\" \"npm --prefix frontend start\"",
+    "dev:full": "npm run dev",
+    "dev:be": "npm --prefix backend run dev",
+    "dev:fe": "npm --prefix frontend start",
+    "start:be": "npm --prefix backend run start",
+    "start:fe": "npm --prefix frontend start",
+    "db:migrate": "npm --prefix backend run db:migrate",
+    "db:seed": "npm --prefix backend run db:seed",
+    "db:import-legacy": "npm --prefix backend run db:import-legacy",
+    "db:import-legacy:keep": "npm --prefix backend run db:import-legacy:keep",
+    "build:fe": "npm --prefix frontend run build",
+    "build": "npm run db:migrate && npm run build:fe"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.6.2"
+  }
+}

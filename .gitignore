@@ -1,0 +1,46 @@
+# Node modules
+node_modules/
+**/node_modules/
+
+# Build outputs
+dist/
+build/
+frontend/dist/
+frontend/.angular/
+
+# Environment files
+.env
+.env.local
+
+# Database
+*.db
+backend/data/*.db
+
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# Output folders
+backend/output/
+backend/data/backup/
+
+# Temporary files
+*.tmp
+*.temp

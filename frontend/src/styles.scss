@@ -1,0 +1,243 @@
+:root {
+	--bg-1: #ecfeff;
+	--bg-2: #f8fafc;
+	--text: #0f172a;
+	--muted: #475569;
+	--muted-2: #64748b;
+	--surface: rgba(255, 255, 255, 0.68);
+	--surface-strong: rgba(255, 255, 255, 0.82);
+	--line: rgba(148, 163, 184, 0.45);
+	--primary: #0ea5e9;
+	--primary-dark: #1d4ed8;
+	--danger: #b91c1c;
+	--shadow: 0 10px 30px rgba(15, 23, 42, 0.12);
+	--radius: 14px;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	font-family: "Segoe UI", Arial, sans-serif;
+	background: radial-gradient(circle at 12% 10%, #dbeafe 0%, transparent 35%),
+		linear-gradient(160deg, var(--bg-1), var(--bg-2) 45%, #ecfeff 100%);
+	color: var(--text);
+	line-height: 1.5;
+}
+
+body.theme-high-contrast {
+	--bg-1: #000000;
+	--bg-2: #0a0a0a;
+	--text: #ffffff;
+	--muted: #e5e7eb;
+	--muted-2: #d1d5db;
+	--surface: rgba(0, 0, 0, 0.95);
+	--surface-strong: rgba(0, 0, 0, 0.98);
+	--line: #ffffff;
+	--primary: #ffeb3b;
+	--primary-dark: #facc15;
+	--danger: #ff6b6b;
+	--shadow: none;
+	background: #000;
+}
+
+h1,
+h2,
+h3,
+h4 {
+	margin-top: 0;
+	margin-bottom: 0.55rem;
+	color: #0f172a;
+	letter-spacing: 0.1px;
+	line-height: 1.22;
+}
+
+h1 {
+	font-size: clamp(1.2rem, 1.5vw, 1.45rem);
+	font-weight: 700;
+}
+
+h2 {
+	font-size: clamp(1.08rem, 1.25vw, 1.3rem);
+	font-weight: 700;
+}
+
+h3 {
+	font-size: clamp(0.98rem, 1.05vw, 1.12rem);
+	font-weight: 700;
+}
+
+p {
+	color: var(--muted);
+	margin: 0 0 0.7rem;
+}
+
+input,
+select,
+button,
+textarea {
+	font: inherit;
+}
+
+input,
+select,
+textarea {
+	width: 100%;
+	padding: 0.66rem 0.76rem;
+	border: 1px solid var(--line);
+	border-radius: 10px;
+	background: rgba(255, 255, 255, 0.82);
+	color: var(--text);
+	transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+	outline: none;
+	border-color: var(--primary);
+	box-shadow: 0 0 0 4px rgba(14, 165, 233, 0.2);
+}
+
+button {
+	background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+	color: #fff;
+	border: none;
+	border-radius: 10px;
+	padding: 0.66rem 0.96rem;
+	cursor: pointer;
+	font-weight: 600;
+	line-height: 1.2;
+	transition: transform 0.08s ease, filter 0.15s ease;
+}
+
+button:hover {
+	filter: brightness(1.06);
+}
+
+button:active {
+	transform: translateY(1px);
+}
+
+a {
+	color: var(--primary-dark);
+	font-weight: 500;
+}
+
+form {
+	display: grid;
+	gap: 0.85rem;
+	max-width: 780px;
+}
+
+label {
+	display: grid;
+	gap: 0.28rem;
+	font-size: 0.93rem;
+	font-weight: 600;
+	color: #1e293b;
+}
+
+table {
+	width: 100%;
+	border-collapse: collapse;
+	overflow: hidden;
+	border-radius: 12px;
+	background: var(--surface-strong);
+	backdrop-filter: blur(6px);
+	box-shadow: var(--shadow);
+}
+
+th,
+td {
+	padding: 0.76rem;
+	border-bottom: 1px solid var(--line);
+	text-align: left;
+	vertical-align: top;
+	font-size: 0.93rem;
+}
+
+th {
+	background: rgba(226, 232, 240, 0.52);
+	color: #1e293b;
+	font-weight: 700;
+}
+
+body.theme-high-contrast h1,
+body.theme-high-contrast h2,
+body.theme-high-contrast h3,
+body.theme-high-contrast h4,
+body.theme-high-contrast p,
+body.theme-high-contrast label,
+body.theme-high-contrast th,
+body.theme-high-contrast td,
+body.theme-high-contrast span,
+body.theme-high-contrast a {
+	color: #fff;
+}
+
+body.theme-high-contrast input,
+body.theme-high-contrast select,
+body.theme-high-contrast textarea {
+	background: #000;
+	color: #fff;
+	border: 2px solid #fff;
+}
+
+body.theme-high-contrast button {
+	background: #ffeb3b;
+	color: #000;
+	border: 2px solid #000;
+}
+
+body.theme-high-contrast section,
+body.theme-high-contrast table {
+	border: 2px solid #fff;
+	background: #000;
+}
+
+body.theme-high-contrast th {
+	background: #111;
+}
+
+body.theme-high-contrast a {
+	text-decoration: underline;
+}
+
+tbody tr:hover td {
+	background: rgba(224, 242, 254, 0.35);
+}
+
+section {
+	background: var(--surface);
+	border: 1px solid var(--line);
+	backdrop-filter: blur(8px);
+	border-radius: var(--radius);
+	padding: 1.05rem;
+	box-shadow: var(--shadow);
+}
+
+.toolbar {
+	display: flex;
+	gap: 0.75rem;
+	align-items: center;
+	margin-bottom: 0.95rem;
+	flex-wrap: wrap;
+}
+
+.error {
+	color: var(--danger);
+	font-weight: 600;
+}
+
+.muted {
+	color: var(--muted-2);
+}
+
+.amount-preview {
+	margin: 0;
+	font-size: 0.9rem;
+	color: #334155;
+}
