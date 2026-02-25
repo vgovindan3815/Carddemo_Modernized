@@ -1,25 +1,38 @@
-{
-  "name": "carddemo-modernized-app",
-  "private": true,
+﻿{
+  "name": "carddemo-modernized",
   "version": "1.0.0",
+  "description": "AWS CardDemo - Mainframe Modernization (CICS/COBOL to Angular/Node.js)",
+  "keywords": [
+    "mainframe",
+    "modernization",
+    "cobol",
+    "cics",
+    "angular",
+    "node.js"
+  ],
+  "homepage": "https://github.com/vgovindan3815/Carddemo_Modernized",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vgovindan3815/Carddemo_Modernized.git"
+  },
   "scripts": {
-    "dev": "concurrently \"npm --prefix backend run dev\" \"npm --prefix frontend start\"",
-    "dev:full": "npm run dev",
-    "dev:be": "npm --prefix backend run dev",
-    "dev:fe": "npm --prefix frontend start",
-    "start:be": "npm --prefix backend run start",
-    "start:fe": "npm --prefix frontend start",
-    "db:migrate": "npm --prefix backend run db:migrate",
-    "db:seed": "npm --prefix backend run db:seed",
-    "db:import-legacy": "npm --prefix backend run db:import-legacy",
-    "db:import-legacy:keep": "npm --prefix backend run db:import-legacy:keep",
-    "build:fe": "npm --prefix frontend run build",
-    "build": "npm run db:migrate && npm run build:fe"
+    "install:all": "cd backend && npm install && cd ../frontend && npm install",
+    "build:frontend": "cd frontend && npm run build -- --configuration production",
+    "docker:build": "docker-compose build",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f",
+    "docker:ps": "docker-compose ps",
+    "docker:deploy": "powershell .\\deploy\\deploy-docker.ps1",
+    "test": "cd backend && npm test",
+    "clean": "docker-compose down -v"
   },
-  "devDependencies": {
-    "concurrently": "^9.2.1"
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
   },
-  "dependencies": {
-    "better-sqlite3": "^12.6.2"
-  }
+  "author": {
+    "name": "Accenture"
+  },
+  "license": "ISC"
 }
