@@ -740,7 +740,7 @@ sqlite> .schema
 
 ## License
 
-Based on the AWS Card Demo modernization from COBOL/CICS to cloud-native technologies.
+This project is part of the AWS Mainframe Modernization initiative. Based on the AWS Card Demo modernization from COBOL/CICS to cloud-native technologies.
 
 ---
 
