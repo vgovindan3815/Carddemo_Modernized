@@ -9,7 +9,8 @@ const mainMenuOptions = [
   { option: 8, label: 'Transaction Add', route: '/transactions/new', program: 'COTRN02C' },
   { option: 9, label: 'Transaction Reports', route: '/reports/transactions', program: 'CORPT00C' },
   { option: 10, label: 'Bill Payment', route: '/billing/payment', program: 'COBIL00C' },
-  { option: 11, label: 'Pending Authorizations', route: '/authorizations', program: 'COPAUS0C' }
+  { option: 11, label: 'Pending Authorizations', route: '/authorizations', program: 'COPAUS0C' },
+  { option: 12, label: 'AI Assistant', route: '/assistant', program: 'COAIST0C' }
 ];
 
 const adminMenuOptions = [

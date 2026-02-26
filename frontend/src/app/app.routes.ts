@@ -22,6 +22,7 @@ import { BatchRunsPageComponent } from './pages/batch-runs.page';
 import { BatchRunDetailPageComponent } from './pages/batch-run-detail.page';
 import { AuthorizationsListPageComponent } from './pages/authorizations-list.page';
 import { AuthorizationViewPageComponent } from './pages/authorization-view.page';
+import { AssistantPageComponent } from './pages/assistant.page';
 
 export const routes: Routes = [
 	{ path: '', pathMatch: 'full', redirectTo: 'signon' },
@@ -49,6 +50,7 @@ export const routes: Routes = [
 			{ path: 'reports/transactions', component: ReportRequestPageComponent },
 			{ path: 'authorizations', component: AuthorizationsListPageComponent },
 			{ path: 'authorizations/view/:authId', component: AuthorizationViewPageComponent },
+			{ path: 'assistant', component: AssistantPageComponent },
 			{ path: 'batch/submit', component: BatchSubmitPageComponent, canActivate: [adminGuard] },
 			{ path: 'batch/runs', component: BatchRunsPageComponent, canActivate: [adminGuard] },
 			{ path: 'batch/runs/:jobRunId', component: BatchRunDetailPageComponent, canActivate: [adminGuard] }
