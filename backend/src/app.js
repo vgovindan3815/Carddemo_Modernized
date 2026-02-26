@@ -30,7 +30,7 @@ app.use((req, res, next) => {
 
 app.use(pinoHttp({ logger }));
 app.use(helmet());
-app.use(cors({ origin: ['http://localhost:4200'], credentials: true }));
+app.use(cors({ origin: ['http://localhost:4200', 'http://localhost:4000'], credentials: true }));
 app.use(express.json());
 app.use(session({
   secret: process.env.SESSION_SECRET || 'carddemo-dev-secret',
