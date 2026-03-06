@@ -35,6 +35,14 @@ Legacy batch jobs read/write VSAM and sequential datasets (DD-based). Modernized
 
 ## 1.4 Implemented modernization deltas (as-built on 2026-02-24)
 
+- **End-to-end legacy data bootstrap executed (2026-03-06):**
+  - Ran `npm run db:import-legacy` to ingest baseline records from `Src/.../app/data/ASCII`.
+  - Loaded `customers`, `accounts`, `cards`, `card_xref`, and `transactions` successfully.
+  - Verified expected counts post-load (50/50/50/50/300 respectively).
+- **Replace-all import mode hardened for foreign keys (2026-03-06):**
+  - Updated import flow to clear target tables outside the insert transaction with temporary FK disable/enable.
+  - Prevents FK delete failures during full refresh imports while preserving FK checks for inserts.
+
 - `ACCTFILE` is implemented as a file-driven ingest job in the modern runner (no longer metadata-only validation).
   - Supports fixed-width legacy records and delimited/json variants.
   - Uses overpunch signed-decimal decoding for amount fields.

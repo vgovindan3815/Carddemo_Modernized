@@ -2,6 +2,15 @@
 
 ## Implemented deltas since baseline spec (2026-02-24)
 
+- **Added update-screen back navigation fallback (2026-03-06):**
+  - Added Back button on Account Update and Card Update screens.
+  - Implemented previous-page navigation using browser history.
+  - Added safe fallback routes when history is unavailable (`/accounts/view` and `/cards`).
+- **Loaded legacy reference data into modernized SQLite model (2026-03-06):**
+  - Executed fixed-width ingestion from `Src/aws-mainframe-modernization-carddemo-main/app/data/ASCII`.
+  - Imported customers, accounts, cards, card_xref, and transactions into modern tables.
+  - Verified referential integrity and row counts after import.
+
 - Added `GET /api/v1/accounts` paged list endpoint (`search`, `page`, `pageSize`, `sort`) to support account overview grid UX.
 - Enhanced `POST /api/v1/billing/payments` to optionally accept and persist card details (`cardNum`, `expirationDate`, `secretCode`) for future reuse.
 - Added account-driven billing UX behavior: entering/selecting account id auto-loads saved card details when available.

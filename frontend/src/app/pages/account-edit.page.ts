@@ -1,7 +1,7 @@
 import { Component, ElementRef, OnInit, ViewChild, inject } from '@angular/core';
-import { CommonModule } from '@angular/common';
+import { CommonModule, Location } from '@angular/common';
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
-import { ActivatedRoute } from '@angular/router';
+import { ActivatedRoute, Router } from '@angular/router';
 import { ApiService } from '../core/api.service';
 
 @Component({
@@ -10,6 +10,9 @@ import { ApiService } from '../core/api.service';
   template: `
     <h2>{{ customerOnly ? 'Customer Update' : 'Account Update' }}</h2>
     <p class="intro">Update account and customer details.</p>
+    <div class="page-actions">
+      <button type="button" (click)="goBack()">Back</button>
+    </div>
     <form [formGroup]="form" (ngSubmit)="save()">
       <div class="toolbar">
         <label>Account ID <input formControlName="acctId" /></label>
@@ -66,6 +69,7 @@ import { ApiService } from '../core/api.service';
     `.intro{margin:0 0 .85rem;color:#475569}`,
     `form{display:grid;max-width:720px;gap:.7rem}`,
     `.toolbar{display:flex;gap:.75rem;align-items:end}`,
+    `.page-actions{margin:0 0 .85rem}`,
     `.section-title{margin:.9rem 0 .1rem;font-size:1rem;color:#0f172a}`,
     `details.section-block{border:1px solid var(--line);border-radius:10px;padding:.6rem;margin-bottom:.6rem;background:var(--surface)}`,
     `details.section-block summary{cursor:pointer}`,
@@ -77,7 +81,9 @@ import { ApiService } from '../core/api.service';
 export class AccountEditPageComponent implements OnInit {
   private readonly fb = inject(FormBuilder);
   private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
   private readonly api = inject(ApiService);
+  private readonly location = inject(Location);
   @ViewChild('customerSection') customerSection?: ElementRef<HTMLElement>;
 
   message = '';
@@ -220,5 +226,13 @@ export class AccountEditPageComponent implements OnInit {
       next: () => this.message = 'Account updated',
       error: (e) => this.message = e?.error?.message || 'Failed'
     });
+  }
+
+  goBack(): void {
+    if (window.history.length > 1) {
+      this.location.back();
+      return;
+    }
+    this.router.navigate(['/accounts/view']);
   }
 }

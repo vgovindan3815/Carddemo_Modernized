@@ -1,7 +1,7 @@
 import { Component, OnInit, inject } from '@angular/core';
-import { CommonModule } from '@angular/common';
+import { CommonModule, Location } from '@angular/common';
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
-import { ActivatedRoute } from '@angular/router';
+import { ActivatedRoute, Router } from '@angular/router';
 import { ApiService } from '../core/api.service';
 
 @Component({
@@ -10,6 +10,9 @@ import { ApiService } from '../core/api.service';
   template: `
     <h2>Card Update</h2>
     <p class="intro">Modify card attributes and save updates.</p>
+    <div class="page-actions">
+      <button type="button" (click)="goBack()">Back</button>
+    </div>
     <form [formGroup]="form" (ngSubmit)="save()">
       <label>Card Number <input formControlName="cardNum" readonly /></label>
       <label>Embossed Name <input formControlName="embossedName" /></label>
@@ -23,6 +26,7 @@ import { ApiService } from '../core/api.service';
   `,
   styles: [
     `.intro{margin:0 0 .85rem;color:#475569}`,
+    `.page-actions{margin:0 0 .85rem}`,
     `form{display:grid;max-width:560px;gap:.7rem}`,
     `.error{margin:0;color:#b91c1c}`,
     `.success{margin:0;color:#166534}`
@@ -30,6 +34,8 @@ import { ApiService } from '../core/api.service';
 })
 export class CardEditPageComponent implements OnInit {
   private readonly fb = inject(FormBuilder);
+  private readonly router = inject(Router);
+  private readonly location = inject(Location);
   message = '';
   readonly form = this.fb.group({
     cardNum: ['4444333322221111', Validators.required],
@@ -51,5 +57,13 @@ export class CardEditPageComponent implements OnInit {
     const value = this.form.getRawValue();
     this.api.updateCard(value.cardNum!, { confirm: value.confirm, embossedName: value.embossedName, activeStatus: value.activeStatus, expirationDate: value.expirationDate })
       .subscribe({ next: () => this.message = 'Card updated', error: (e) => this.message = e?.error?.message || 'Failed' });
+  }
+
+  goBack(): void {
+    if (window.history.length > 1) {
+      this.location.back();
+      return;
+    }
+    this.router.navigate(['/cards']);
   }
 }

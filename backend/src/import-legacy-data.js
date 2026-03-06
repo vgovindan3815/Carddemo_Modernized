@@ -289,11 +289,14 @@ function runImport(options = readOptions()) {
   migrate();
   const keepExisting = Boolean(options.keepExisting);
 
-  const results = db.transaction(() => {
-    if (!keepExisting) {
-      clearTargetTables();
-    }
+  // Clear tables outside of transaction if needed
+  if (!keepExisting) {
+    db.pragma('foreign_keys = OFF');
+    clearTargetTables();
+    db.pragma('foreign_keys = ON');
+  }
 
+  const results = db.transaction(() => {
     return {
       mode: keepExisting ? 'keep-existing' : 'replace-all',
       customers: importCustomers(keepExisting),
