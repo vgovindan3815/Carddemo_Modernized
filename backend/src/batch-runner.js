@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { createHash, randomUUID } = require('crypto');
 const { sqlOne, sqlAll, sqlRun, sqlTx } = require('./db');
+const { put: blobPut } = (() => { try { return require('@vercel/blob'); } catch { return { put: null }; } })();
 
 const outputRoot = process.env.BATCH_OUTPUT_DIR || path.join(__dirname, '..', 'output');
 const acctfileDefaultInputPath = process.env.ACCTFILE_INPUT_FILE || 'data/input/acctdata.txt';
@@ -9,7 +10,9 @@ const custfileDefaultInputPath = process.env.CUSTFILE_INPUT_FILE || 'data/input/
 const cardfileDefaultInputPath = process.env.CARDFILE_INPUT_FILE || 'data/input/carddata.txt';
 const cardxrefDefaultInputPath = process.env.CARDXREF_INPUT_FILE || 'data/input/cardxref.txt';
 const legacyAsciiInputDir = path.join(__dirname, '..', '..', 'Src', 'aws-mainframe-modernization-carddemo-main', 'app', 'data', 'ASCII');
-fs.mkdirSync(outputRoot, { recursive: true });
+if (!process.env.BLOB_READ_WRITE_TOKEN) {
+  fs.mkdirSync(outputRoot, { recursive: true });
+}
 
 const runningJobRuns = new Set();
 
@@ -93,15 +96,34 @@ function checksum(content) {
   return createHash('sha256').update(content).digest('hex');
 }
 
-function writeArtifactFile(runDir, fileName, content) {
+async function writeArtifactFile(runDir, fileName, content) {
+  const sha256 = checksum(content);
+  const sizeBytes = Buffer.byteLength(content, 'utf8');
+
+  if (blobPut && process.env.BLOB_READ_WRITE_TOKEN) {
+    const blobKey = `batch/${path.basename(runDir)}/${fileName}`;
+    const blob = await blobPut(blobKey, content, {
+      access: 'public',
+      token: process.env.BLOB_READ_WRITE_TOKEN,
+      contentType: 'text/plain'
+    });
+    return { storagePath: blob.url, storageKind: 'blob', sizeBytes, checksumSha256: sha256 };
+  }
+
+  fs.mkdirSync(runDir, { recursive: true });
   const filePath = path.join(runDir, fileName);
   fs.writeFileSync(filePath, content, 'utf8');
-  const stat = fs.statSync(filePath);
-  return {
-    storagePath: filePath,
-    sizeBytes: stat.size,
-    checksumSha256: checksum(content)
-  };
+  return { storagePath: filePath, storageKind: 'file', sizeBytes, checksumSha256: sha256 };
+}
+
+async function readArtifactContent(artifact) {
+  if (!artifact) throw new Error('No artifact to read');
+  if (artifact.storage_kind === 'blob') {
+    const resp = await fetch(artifact.storage_path);
+    if (!resp.ok) throw new Error(`Failed to fetch blob artifact: ${artifact.storage_path}`);
+    return resp.text();
+  }
+  return fs.readFileSync(artifact.storage_path, 'utf8');
 }
 
 function normalizeDateText(value) {
@@ -531,11 +553,11 @@ async function executePosttranStep(jobRunId, step, parameters, runDir) {
   ].join('\n');
 
   const reportName = `POSTTRAN_${processingDate.replace(/-/g, '')}.txt`;
-  const reportWritten = writeArtifactFile(runDir, reportName, reportContent);
+  const reportWritten = await writeArtifactFile(runDir, reportName, reportContent);
 
   const logText = `[${nowIso()}] POSTTRAN/${step.name} posted ${summary.postedCount} transactions amount=${summary.totalAmount.toFixed(2)} RC=0`;
   const logName = `POSTTRAN_${step.name}.log`;
-  const logWritten = writeArtifactFile(runDir, logName, logText);
+  const logWritten = await writeArtifactFile(runDir, logName, logText);
 
   return {
     returnCode: 0,
@@ -545,6 +567,7 @@ async function executePosttranStep(jobRunId, step, parameters, runDir) {
         artifactType: 'report',
         name: reportName,
         mimeType: 'text/plain',
+        storageKind: reportWritten.storageKind,
         storagePath: reportWritten.storagePath,
         sizeBytes: reportWritten.sizeBytes,
         checksumSha256: reportWritten.checksumSha256
@@ -553,6 +576,7 @@ async function executePosttranStep(jobRunId, step, parameters, runDir) {
         artifactType: 'log',
         name: logName,
         mimeType: 'text/plain',
+        storageKind: logWritten.storageKind,
         storagePath: logWritten.storagePath,
         sizeBytes: logWritten.sizeBytes,
         checksumSha256: logWritten.checksumSha256
@@ -610,10 +634,10 @@ async function executeIntcalcStep(jobRunId, step, parameters, runDir) {
   ].join('\n');
 
   const reportName = `INTCALC_${processingDate.replace(/-/g, '')}.txt`;
-  const reportWritten = writeArtifactFile(runDir, reportName, reportContent);
+  const reportWritten = await writeArtifactFile(runDir, reportName, reportContent);
   const logText = `[${nowIso()}] INTCALC/${step.name} accrued ${accruedCount} accounts total=${accruedTotal.toFixed(2)} RC=0`;
   const logName = `INTCALC_${step.name}.log`;
-  const logWritten = writeArtifactFile(runDir, logName, logText);
+  const logWritten = await writeArtifactFile(runDir, logName, logText);
 
   return {
     returnCode: 0,
@@ -623,6 +647,7 @@ async function executeIntcalcStep(jobRunId, step, parameters, runDir) {
         artifactType: 'report',
         name: reportName,
         mimeType: 'text/plain',
+        storageKind: reportWritten.storageKind,
         storagePath: reportWritten.storagePath,
         sizeBytes: reportWritten.sizeBytes,
         checksumSha256: reportWritten.checksumSha256
@@ -631,6 +656,7 @@ async function executeIntcalcStep(jobRunId, step, parameters, runDir) {
         artifactType: 'log',
         name: logName,
         mimeType: 'text/plain',
+        storageKind: logWritten.storageKind,
         storagePath: logWritten.storagePath,
         sizeBytes: logWritten.sizeBytes,
         checksumSha256: logWritten.checksumSha256
@@ -693,10 +719,10 @@ async function executeTranreptStep(_jobRunId, step, parameters, runDir) {
   ].join('\n');
 
   const reportName = `TRANREPT_${endDate.replace(/-/g, '')}.txt`;
-  const reportWritten = writeArtifactFile(runDir, reportName, reportContent);
+  const reportWritten = await writeArtifactFile(runDir, reportName, reportContent);
   const logText = `[${nowIso()}] TRANREPT/${step.name} generated ${rows.length} rows total=${totalAmount.toFixed(2)} RC=0`;
   const logName = `TRANREPT_${step.name}.log`;
-  const logWritten = writeArtifactFile(runDir, logName, logText);
+  const logWritten = await writeArtifactFile(runDir, logName, logText);
 
   return {
     returnCode: 0,
@@ -706,6 +732,7 @@ async function executeTranreptStep(_jobRunId, step, parameters, runDir) {
         artifactType: 'report',
         name: reportName,
         mimeType: 'text/plain',
+        storageKind: reportWritten.storageKind,
         storagePath: reportWritten.storagePath,
         sizeBytes: reportWritten.sizeBytes,
         checksumSha256: reportWritten.checksumSha256
@@ -714,6 +741,7 @@ async function executeTranreptStep(_jobRunId, step, parameters, runDir) {
         artifactType: 'log',
         name: logName,
         mimeType: 'text/plain',
+        storageKind: logWritten.storageKind,
         storagePath: logWritten.storagePath,
         sizeBytes: logWritten.sizeBytes,
         checksumSha256: logWritten.checksumSha256
@@ -745,7 +773,7 @@ async function executeCbexportStep(jobRunId, step, parameters, runDir) {
 
   const extractName = `CBEXPORT_${processingDate.replace(/-/g, '')}.json`;
   const extractContent = JSON.stringify(exportSnapshot, null, 2);
-  const extractWritten = writeArtifactFile(runDir, extractName, extractContent);
+  const extractWritten = await writeArtifactFile(runDir, extractName, extractContent);
 
   let recordSeq = 0;
 
@@ -773,11 +801,11 @@ async function executeCbexportStep(jobRunId, step, parameters, runDir) {
     `generatedAt=${nowIso()}`
   ].join('\n');
   const summaryName = `CBEXPORT_${processingDate.replace(/-/g, '')}_SUMMARY.txt`;
-  const summaryWritten = writeArtifactFile(runDir, summaryName, summaryText);
+  const summaryWritten = await writeArtifactFile(runDir, summaryName, summaryText);
 
   const logText = `[${nowIso()}] CBEXPORT/${step.name} exported entities: ${JSON.stringify(counts)} RC=0`;
   const logName = `CBEXPORT_${step.name}.log`;
-  const logWritten = writeArtifactFile(runDir, logName, logText);
+  const logWritten = await writeArtifactFile(runDir, logName, logText);
 
   return {
     returnCode: 0,
@@ -787,6 +815,7 @@ async function executeCbexportStep(jobRunId, step, parameters, runDir) {
         artifactType: 'extract',
         name: extractName,
         mimeType: 'application/json',
+        storageKind: extractWritten.storageKind,
         storagePath: extractWritten.storagePath,
         sizeBytes: extractWritten.sizeBytes,
         checksumSha256: extractWritten.checksumSha256
@@ -795,6 +824,7 @@ async function executeCbexportStep(jobRunId, step, parameters, runDir) {
         artifactType: 'report',
         name: summaryName,
         mimeType: 'text/plain',
+        storageKind: summaryWritten.storageKind,
         storagePath: summaryWritten.storagePath,
         sizeBytes: summaryWritten.sizeBytes,
         checksumSha256: summaryWritten.checksumSha256
@@ -803,6 +833,7 @@ async function executeCbexportStep(jobRunId, step, parameters, runDir) {
         artifactType: 'log',
         name: logName,
         mimeType: 'text/plain',
+        storageKind: logWritten.storageKind,
         storagePath: logWritten.storagePath,
         sizeBytes: logWritten.sizeBytes,
         checksumSha256: logWritten.checksumSha256
@@ -817,23 +848,23 @@ async function executeCbimportStep(jobRunId, step, parameters, runDir) {
 
   const processingDate = parameters?.processingDate || nowIso().slice(0, 10);
   const source = await sqlOne(`
-    SELECT storage_path as storagePath, name
+    SELECT storage_path as storagePath, storage_kind as storageKind, name
     FROM artifacts
-    WHERE artifact_type = 'extract' AND name LIKE 'CBEXPORT_%' AND storage_kind = 'file'
+    WHERE artifact_type = 'extract' AND name LIKE 'CBEXPORT_%'
     ORDER BY created_at DESC
     LIMIT 1
   `, []);
 
-  if (!source || !source.storagePath || !fs.existsSync(source.storagePath)) {
+  if (!source || !source.storagePath) {
     const errorMsg = 'No CBEXPORT extract available for import';
     await sqlRun('INSERT INTO stage_import_errors (job_run_id, record_seq, error_message, raw_record, created_at) VALUES (?, ?, ?, ?, ?)', [jobRunId, 0, errorMsg, null, nowIso()]);
 
     const errorReport = ['CBIMPORT SUMMARY', `processingDate=${processingDate}`, `status=warning`, `error=${errorMsg}`, `generatedAt=${nowIso()}`].join('\n');
     const reportName = `CBIMPORT_${processingDate.replace(/-/g, '')}_ERRORS.txt`;
-    const reportWritten = writeArtifactFile(runDir, reportName, errorReport);
+    const reportWritten = await writeArtifactFile(runDir, reportName, errorReport);
     const logText = `[${nowIso()}] CBIMPORT/${step.name} warning: ${errorMsg} RC=4`;
     const logName = `CBIMPORT_${step.name}.log`;
-    const logWritten = writeArtifactFile(runDir, logName, logText);
+    const logWritten = await writeArtifactFile(runDir, logName, logText);
 
     return {
       returnCode: 4,
@@ -843,6 +874,7 @@ async function executeCbimportStep(jobRunId, step, parameters, runDir) {
           artifactType: 'report',
           name: reportName,
           mimeType: 'text/plain',
+          storageKind: reportWritten.storageKind,
           storagePath: reportWritten.storagePath,
           sizeBytes: reportWritten.sizeBytes,
           checksumSha256: reportWritten.checksumSha256
@@ -851,6 +883,7 @@ async function executeCbimportStep(jobRunId, step, parameters, runDir) {
           artifactType: 'log',
           name: logName,
           mimeType: 'text/plain',
+          storageKind: logWritten.storageKind,
           storagePath: logWritten.storagePath,
           sizeBytes: logWritten.sizeBytes,
           checksumSha256: logWritten.checksumSha256
@@ -860,7 +893,7 @@ async function executeCbimportStep(jobRunId, step, parameters, runDir) {
     };
   }
 
-  const payloadRaw = fs.readFileSync(source.storagePath, 'utf8');
+  const payloadRaw = await readArtifactContent(source);
   let payload;
   try {
     payload = JSON.parse(payloadRaw);
@@ -1004,10 +1037,10 @@ async function executeCbimportStep(jobRunId, step, parameters, runDir) {
   ].join('\n');
 
   const summaryName = `CBIMPORT_${processingDate.replace(/-/g, '')}_SUMMARY.txt`;
-  const summaryWritten = writeArtifactFile(runDir, summaryName, summaryText);
+  const summaryWritten = await writeArtifactFile(runDir, summaryName, summaryText);
   const logText = `[${nowIso()}] CBIMPORT/${step.name} imported customers=${imported.customers}, accounts=${imported.accounts}, cards=${imported.cards}, transactions=${imported.transactions}, errors=${imported.errors} RC=${imported.errors ? 4 : 0}`;
   const logName = `CBIMPORT_${step.name}.log`;
-  const logWritten = writeArtifactFile(runDir, logName, logText);
+  const logWritten = await writeArtifactFile(runDir, logName, logText);
 
   return {
     returnCode: imported.errors ? 4 : 0,
@@ -1017,6 +1050,7 @@ async function executeCbimportStep(jobRunId, step, parameters, runDir) {
         artifactType: 'report',
         name: summaryName,
         mimeType: 'text/plain',
+        storageKind: summaryWritten.storageKind,
         storagePath: summaryWritten.storagePath,
         sizeBytes: summaryWritten.sizeBytes,
         checksumSha256: summaryWritten.checksumSha256
@@ -1025,6 +1059,7 @@ async function executeCbimportStep(jobRunId, step, parameters, runDir) {
         artifactType: 'log',
         name: logName,
         mimeType: 'text/plain',
+        storageKind: logWritten.storageKind,
         storagePath: logWritten.storagePath,
         sizeBytes: logWritten.sizeBytes,
         checksumSha256: logWritten.checksumSha256
@@ -1113,15 +1148,15 @@ async function executeCreastmtStep(jobRunId, step, parameters, runDir) {
     ...statementLines
   ].join('\n');
   const textName = `CREASTMT_${processingDate.replace(/-/g, '')}.txt`;
-  const textWritten = writeArtifactFile(runDir, textName, textContent);
+  const textWritten = await writeArtifactFile(runDir, textName, textContent);
 
   const htmlContent = `<!doctype html><html><head><meta charset="utf-8"/><title>CREASTMT ${processingDate}</title></head><body><h1>CardDemo Statements</h1><p>Processing Date: ${processingDate}</p>${htmlSections.join('')}</body></html>`;
   const htmlName = `CREASTMT_${processingDate.replace(/-/g, '')}.html`;
-  const htmlWritten = writeArtifactFile(runDir, htmlName, htmlContent);
+  const htmlWritten = await writeArtifactFile(runDir, htmlName, htmlContent);
 
   const logText = `[${nowIso()}] CREASTMT/${step.name} generated statements for ${accountRows.length} accounts RC=0`;
   const logName = `CREASTMT_${step.name}.log`;
-  const logWritten = writeArtifactFile(runDir, logName, logText);
+  const logWritten = await writeArtifactFile(runDir, logName, logText);
 
   return {
     returnCode: 0,
@@ -1131,6 +1166,7 @@ async function executeCreastmtStep(jobRunId, step, parameters, runDir) {
         artifactType: 'report',
         name: textName,
         mimeType: 'text/plain',
+        storageKind: textWritten.storageKind,
         storagePath: textWritten.storagePath,
         sizeBytes: textWritten.sizeBytes,
         checksumSha256: textWritten.checksumSha256
@@ -1139,6 +1175,7 @@ async function executeCreastmtStep(jobRunId, step, parameters, runDir) {
         artifactType: 'report',
         name: htmlName,
         mimeType: 'text/html',
+        storageKind: htmlWritten.storageKind,
         storagePath: htmlWritten.storagePath,
         sizeBytes: htmlWritten.sizeBytes,
         checksumSha256: htmlWritten.checksumSha256
@@ -1147,6 +1184,7 @@ async function executeCreastmtStep(jobRunId, step, parameters, runDir) {
         artifactType: 'log',
         name: logName,
         mimeType: 'text/plain',
+        storageKind: logWritten.storageKind,
         storagePath: logWritten.storagePath,
         sizeBytes: logWritten.sizeBytes,
         checksumSha256: logWritten.checksumSha256
@@ -1230,9 +1268,9 @@ async function executeAcctfileStep(_jobRunId, step, parameters, runDir) {
   };
 
   const manifestName = `ACCTFILE_${processingDate.replace(/-/g, '')}_MANIFEST.json`;
-  const manifestWritten = writeArtifactFile(runDir, manifestName, JSON.stringify(manifest, null, 2));
+  const manifestWritten = await writeArtifactFile(runDir, manifestName, JSON.stringify(manifest, null, 2));
   const summaryName = `ACCTFILE_${processingDate.replace(/-/g, '')}_SUMMARY.txt`;
-  const summaryWritten = writeArtifactFile(runDir, summaryName, [
+  const summaryWritten = await writeArtifactFile(runDir, summaryName, [
     'ACCTFILE SUMMARY',
     `processingDate=${processingDate}`,
     `dataset=ACCTDATA.VSAM.KSDS`,
@@ -1249,15 +1287,15 @@ async function executeAcctfileStep(_jobRunId, step, parameters, runDir) {
   const returnCode = upsertSummary.errors > 0 ? 4 : 0;
   const logText = `[${nowIso()}] ACCTFILE/${step.name} validated account dataset total=${totalAccounts} inputFile=${upsertSummary.sourceFile || 'none'} inserted=${upsertSummary.insertedAccounts} updated=${upsertSummary.updatedAccounts} errors=${upsertSummary.errors} RC=${returnCode}`;
   const logName = `ACCTFILE_${step.name}.log`;
-  const logWritten = writeArtifactFile(runDir, logName, logText);
+  const logWritten = await writeArtifactFile(runDir, logName, logText);
 
   return {
     returnCode,
     message: `ACCTFILE processed ${upsertSummary.inputRecords} input records; inserted=${upsertSummary.insertedAccounts}, updated=${upsertSummary.updatedAccounts}, errors=${upsertSummary.errors}`,
     generatedArtifacts: [
-      { artifactType: 'extract', name: manifestName, mimeType: 'application/json', storagePath: manifestWritten.storagePath, sizeBytes: manifestWritten.sizeBytes, checksumSha256: manifestWritten.checksumSha256 },
-      { artifactType: 'report', name: summaryName, mimeType: 'text/plain', storagePath: summaryWritten.storagePath, sizeBytes: summaryWritten.sizeBytes, checksumSha256: summaryWritten.checksumSha256 },
-      { artifactType: 'log', name: logName, mimeType: 'text/plain', storagePath: logWritten.storagePath, sizeBytes: logWritten.sizeBytes, checksumSha256: logWritten.checksumSha256 }
+      { artifactType: 'extract', name: manifestName, mimeType: 'application/json', storageKind: manifestWritten.storageKind, storagePath: manifestWritten.storagePath, sizeBytes: manifestWritten.sizeBytes, checksumSha256: manifestWritten.checksumSha256 },
+      { artifactType: 'report', name: summaryName, mimeType: 'text/plain', storageKind: summaryWritten.storageKind, storagePath: summaryWritten.storagePath, sizeBytes: summaryWritten.sizeBytes, checksumSha256: summaryWritten.checksumSha256 },
+      { artifactType: 'log', name: logName, mimeType: 'text/plain', storageKind: logWritten.storageKind, storagePath: logWritten.storagePath, sizeBytes: logWritten.sizeBytes, checksumSha256: logWritten.checksumSha256 }
     ],
     logLine: logText
   };
@@ -1372,9 +1410,9 @@ async function executeCardfileStep(_jobRunId, step, parameters, runDir) {
   };
 
   const manifestName = `CARDFILE_${processingDate.replace(/-/g, '')}_MANIFEST.json`;
-  const manifestWritten = writeArtifactFile(runDir, manifestName, JSON.stringify(manifest, null, 2));
+  const manifestWritten = await writeArtifactFile(runDir, manifestName, JSON.stringify(manifest, null, 2));
   const summaryName = `CARDFILE_${processingDate.replace(/-/g, '')}_SUMMARY.txt`;
-  const summaryWritten = writeArtifactFile(runDir, summaryName, [
+  const summaryWritten = await writeArtifactFile(runDir, summaryName, [
     'CARDFILE SUMMARY',
     `processingDate=${processingDate}`,
     `dataset=CARDDATA.VSAM.KSDS`,
@@ -1396,15 +1434,15 @@ async function executeCardfileStep(_jobRunId, step, parameters, runDir) {
   const returnCode = upsertSummary.errors > 0 ? 4 : 0;
   const logText = `[${nowIso()}] CARDFILE/${step.name} validated card dataset total=${totalCards} cardInput=${upsertSummary.cardSourceFile || 'none'} xrefInput=${upsertSummary.xrefSourceFile || 'none'} insertedCards=${upsertSummary.insertedCards} insertedXref=${upsertSummary.insertedXref} errors=${upsertSummary.errors} RC=${returnCode}`;
   const logName = `CARDFILE_${step.name}.log`;
-  const logWritten = writeArtifactFile(runDir, logName, logText);
+  const logWritten = await writeArtifactFile(runDir, logName, logText);
 
   return {
     returnCode,
     message: `CARDFILE processed cards=${upsertSummary.cardInputRecords}, xref=${upsertSummary.xrefInputRecords}; insertedCards=${upsertSummary.insertedCards}, insertedXref=${upsertSummary.insertedXref}, errors=${upsertSummary.errors}`,
     generatedArtifacts: [
-      { artifactType: 'extract', name: manifestName, mimeType: 'application/json', storagePath: manifestWritten.storagePath, sizeBytes: manifestWritten.sizeBytes, checksumSha256: manifestWritten.checksumSha256 },
-      { artifactType: 'report', name: summaryName, mimeType: 'text/plain', storagePath: summaryWritten.storagePath, sizeBytes: summaryWritten.sizeBytes, checksumSha256: summaryWritten.checksumSha256 },
-      { artifactType: 'log', name: logName, mimeType: 'text/plain', storagePath: logWritten.storagePath, sizeBytes: logWritten.sizeBytes, checksumSha256: logWritten.checksumSha256 }
+      { artifactType: 'extract', name: manifestName, mimeType: 'application/json', storageKind: manifestWritten.storageKind, storagePath: manifestWritten.storagePath, sizeBytes: manifestWritten.sizeBytes, checksumSha256: manifestWritten.checksumSha256 },
+      { artifactType: 'report', name: summaryName, mimeType: 'text/plain', storageKind: summaryWritten.storageKind, storagePath: summaryWritten.storagePath, sizeBytes: summaryWritten.sizeBytes, checksumSha256: summaryWritten.checksumSha256 },
+      { artifactType: 'log', name: logName, mimeType: 'text/plain', storageKind: logWritten.storageKind, storagePath: logWritten.storagePath, sizeBytes: logWritten.sizeBytes, checksumSha256: logWritten.checksumSha256 }
     ],
     logLine: logText
   };
@@ -1489,9 +1527,9 @@ async function executeCustfileStep(_jobRunId, step, parameters, runDir) {
   };
 
   const manifestName = `CUSTFILE_${processingDate.replace(/-/g, '')}_MANIFEST.json`;
-  const manifestWritten = writeArtifactFile(runDir, manifestName, JSON.stringify(manifest, null, 2));
+  const manifestWritten = await writeArtifactFile(runDir, manifestName, JSON.stringify(manifest, null, 2));
   const summaryName = `CUSTFILE_${processingDate.replace(/-/g, '')}_SUMMARY.txt`;
-  const summaryWritten = writeArtifactFile(runDir, summaryName, [
+  const summaryWritten = await writeArtifactFile(runDir, summaryName, [
     'CUSTFILE SUMMARY',
     `processingDate=${processingDate}`,
     `dataset=CUSTDATA.VSAM.KSDS`,
@@ -1509,15 +1547,15 @@ async function executeCustfileStep(_jobRunId, step, parameters, runDir) {
   const returnCode = upsertSummary.errors > 0 ? 4 : 0;
   const logText = `[${nowIso()}] CUSTFILE/${step.name} validated customer dataset total=${totalCustomers} inputFile=${upsertSummary.sourceFile || 'none'} inserted=${upsertSummary.insertedCustomers} updated=${upsertSummary.updatedCustomers} errors=${upsertSummary.errors} RC=${returnCode}`;
   const logName = `CUSTFILE_${step.name}.log`;
-  const logWritten = writeArtifactFile(runDir, logName, logText);
+  const logWritten = await writeArtifactFile(runDir, logName, logText);
 
   return {
     returnCode,
     message: `CUSTFILE processed ${upsertSummary.inputRecords} input records; inserted=${upsertSummary.insertedCustomers}, updated=${upsertSummary.updatedCustomers}, errors=${upsertSummary.errors}`,
     generatedArtifacts: [
-      { artifactType: 'extract', name: manifestName, mimeType: 'application/json', storagePath: manifestWritten.storagePath, sizeBytes: manifestWritten.sizeBytes, checksumSha256: manifestWritten.checksumSha256 },
-      { artifactType: 'report', name: summaryName, mimeType: 'text/plain', storagePath: summaryWritten.storagePath, sizeBytes: summaryWritten.sizeBytes, checksumSha256: summaryWritten.checksumSha256 },
-      { artifactType: 'log', name: logName, mimeType: 'text/plain', storagePath: logWritten.storagePath, sizeBytes: logWritten.sizeBytes, checksumSha256: logWritten.checksumSha256 }
+      { artifactType: 'extract', name: manifestName, mimeType: 'application/json', storageKind: manifestWritten.storageKind, storagePath: manifestWritten.storagePath, sizeBytes: manifestWritten.sizeBytes, checksumSha256: manifestWritten.checksumSha256 },
+      { artifactType: 'report', name: summaryName, mimeType: 'text/plain', storageKind: summaryWritten.storageKind, storagePath: summaryWritten.storagePath, sizeBytes: summaryWritten.sizeBytes, checksumSha256: summaryWritten.checksumSha256 },
+      { artifactType: 'log', name: logName, mimeType: 'text/plain', storageKind: logWritten.storageKind, storagePath: logWritten.storagePath, sizeBytes: logWritten.sizeBytes, checksumSha256: logWritten.checksumSha256 }
     ],
     logLine: logText
   };
@@ -1546,24 +1584,25 @@ async function executeTranbkpStep(_jobRunId, step, parameters, runDir) {
   const backupName = `TRANBKP_${processingDate.replace(/-/g, '')}.json`;
   const backupContent = JSON.stringify(backupPayload, null, 2);
   let backupWritten;
-  if (outputDirPath) {
+  if (outputDirPath && !process.env.BLOB_READ_WRITE_TOKEN) {
     const resolvedOutputDir = resolveOutputDirectoryPath(outputDirPath);
     fs.mkdirSync(resolvedOutputDir, { recursive: true });
     const customBackupPath = path.join(resolvedOutputDir, backupName);
     fs.writeFileSync(customBackupPath, backupContent, 'utf8');
-    const stat = fs.statSync(customBackupPath);
+    const sizeBytes = Buffer.byteLength(backupContent, 'utf8');
     backupWritten = {
       storagePath: customBackupPath,
-      sizeBytes: stat.size,
+      storageKind: 'file',
+      sizeBytes,
       checksumSha256: checksum(backupContent)
     };
   } else {
-    backupWritten = writeArtifactFile(runDir, backupName, backupContent);
+    backupWritten = await writeArtifactFile(runDir, backupName, backupContent);
   }
 
   const totals = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
   const summaryName = `TRANBKP_${processingDate.replace(/-/g, '')}_SUMMARY.txt`;
-  const summaryWritten = writeArtifactFile(runDir, summaryName, [
+  const summaryWritten = await writeArtifactFile(runDir, summaryName, [
     'TRANBKP SUMMARY',
     `processingDate=${processingDate}`,
     `transactionCount=${rows.length}`,
@@ -1575,15 +1614,15 @@ async function executeTranbkpStep(_jobRunId, step, parameters, runDir) {
 
   const logText = `[${nowIso()}] TRANBKP/${step.name} backed up ${rows.length} transactions outputDirPath=${outputDirPath || 'default-run-output'} RC=0`;
   const logName = `TRANBKP_${step.name}.log`;
-  const logWritten = writeArtifactFile(runDir, logName, logText);
+  const logWritten = await writeArtifactFile(runDir, logName, logText);
 
   return {
     returnCode: 0,
     message: `Backed up ${rows.length} transactions totaling ${totals.toFixed(2)}`,
     generatedArtifacts: [
-      { artifactType: 'extract', name: backupName, mimeType: 'application/json', storagePath: backupWritten.storagePath, sizeBytes: backupWritten.sizeBytes, checksumSha256: backupWritten.checksumSha256 },
-      { artifactType: 'report', name: summaryName, mimeType: 'text/plain', storagePath: summaryWritten.storagePath, sizeBytes: summaryWritten.sizeBytes, checksumSha256: summaryWritten.checksumSha256 },
-      { artifactType: 'log', name: logName, mimeType: 'text/plain', storagePath: logWritten.storagePath, sizeBytes: logWritten.sizeBytes, checksumSha256: logWritten.checksumSha256 }
+      { artifactType: 'extract', name: backupName, mimeType: 'application/json', storageKind: backupWritten.storageKind, storagePath: backupWritten.storagePath, sizeBytes: backupWritten.sizeBytes, checksumSha256: backupWritten.checksumSha256 },
+      { artifactType: 'report', name: summaryName, mimeType: 'text/plain', storageKind: summaryWritten.storageKind, storagePath: summaryWritten.storagePath, sizeBytes: summaryWritten.sizeBytes, checksumSha256: summaryWritten.checksumSha256 },
+      { artifactType: 'log', name: logName, mimeType: 'text/plain', storageKind: logWritten.storageKind, storagePath: logWritten.storagePath, sizeBytes: logWritten.sizeBytes, checksumSha256: logWritten.checksumSha256 }
     ],
     logLine: logText
   };
@@ -1609,11 +1648,12 @@ async function executeDefaultStep(jobName, step, parameters, runDir) {
 
   const logText = `[${nowIso()}] ${message} RC=${returnCode}`;
   const logFileName = `${jobName}_${step.name}.log`;
-  const written = writeArtifactFile(runDir, logFileName, logText);
+  const written = await writeArtifactFile(runDir, logFileName, logText);
   generatedArtifacts.push({
     artifactType: 'log',
     name: logFileName,
     mimeType: 'text/plain',
+    storageKind: written.storageKind,
     storagePath: written.storagePath,
     sizeBytes: written.sizeBytes,
     checksumSha256: written.checksumSha256
@@ -1689,7 +1729,9 @@ async function submitJob({ jobName, runMode, parameters, submittedBy, correlatio
 
   const jobRunId = generateJobRunId();
   const runDir = path.join(outputRoot, jobRunId);
-  fs.mkdirSync(runDir, { recursive: true });
+  if (!process.env.BLOB_READ_WRITE_TOKEN) {
+    fs.mkdirSync(runDir, { recursive: true });
+  }
 
   await sqlRun(`
     INSERT INTO job_runs (
@@ -1757,7 +1799,9 @@ async function executeJobRun(jobRunId) {
 
   const params = parseJson(run.parameters_json, {});
   const runDir = run.output_dir || path.join(outputRoot, jobRunId);
-  fs.mkdirSync(runDir, { recursive: true });
+  if (!process.env.BLOB_READ_WRITE_TOKEN) {
+    fs.mkdirSync(runDir, { recursive: true });
+  }
   const restartMeta = params?.__restart || {};
   const restartMode = restartMeta.mode || 'rerun-all';
   const startStepSeq = await getRestartStartStepSeq(jobRunId, run.restart_of_job_run_id, restartMode);
@@ -1868,14 +1912,14 @@ async function executeJobRun(jobRunId) {
 
       for (const artifact of result.generatedArtifacts) {
         if (artifact.content !== undefined) {
-          const written = writeArtifactFile(runDir, artifact.name, artifact.content);
+          const written = await writeArtifactFile(runDir, artifact.name, artifact.content);
           await addArtifact({
             jobRunId,
             stepRunId,
             artifactType: artifact.artifactType,
             name: artifact.name,
             mimeType: artifact.mimeType,
-            storageKind: 'file',
+            storageKind: written.storageKind,
             storagePath: written.storagePath,
             sizeBytes: written.sizeBytes,
             checksumSha256: written.checksumSha256
@@ -1887,7 +1931,7 @@ async function executeJobRun(jobRunId) {
             artifactType: artifact.artifactType,
             name: artifact.name,
             mimeType: artifact.mimeType,
-            storageKind: 'file',
+            storageKind: artifact.storageKind || 'file',
             storagePath: artifact.storagePath,
             sizeBytes: artifact.sizeBytes,
             checksumSha256: artifact.checksumSha256
@@ -2007,5 +2051,6 @@ module.exports = {
   submitJob,
   getJobs,
   restartJobRun,
-  cancelJobRun
+  cancelJobRun,
+  executeJobRun
 };

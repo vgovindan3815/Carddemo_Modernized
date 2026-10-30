@@ -18,6 +18,9 @@
   "scripts": {
     "install:all": "cd backend && npm install && cd ../frontend && npm install",
     "build:frontend": "cd frontend && npm run build -- --configuration production",
+    "build:vercel": "cd frontend && npm install && npm run build -- --configuration production && cd ../backend && npm install",
+    "db:migrate": "cd backend && npm run db:migrate",
+    "db:seed": "cd backend && npm run db:seed",
     "docker:build": "docker-compose build",
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down",

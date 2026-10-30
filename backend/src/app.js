@@ -15,6 +15,49 @@ const { apiError, errorResponse } = require('./errors');
 const { mainMenuOptions, adminMenuOptions, errorCatalog } = require('./constants');
 const { openApiSpec } = require('./openapi');
 
+class NeonSessionStore extends session.Store {
+  async get(sid, callback) {
+    try {
+      const row = await sqlOne('SELECT sess, expire FROM express_sessions WHERE sid = ?', [sid]);
+      if (!row) return callback(null, null);
+      if (new Date() > new Date(row.expire)) {
+        await sqlRun('DELETE FROM express_sessions WHERE sid = ?', [sid]);
+        return callback(null, null);
+      }
+      callback(null, row.sess);
+    } catch (err) { callback(err); }
+  }
+
+  async set(sid, sessionData, callback) {
+    const maxAge = sessionData.cookie?.maxAge ?? 3600000;
+    const expire = new Date(Date.now() + maxAge).toISOString();
+    try {
+      await sqlRun(
+        `INSERT INTO express_sessions (sid, sess, expire) VALUES (?, ?, ?)
+         ON CONFLICT (sid) DO UPDATE SET sess = EXCLUDED.sess, expire = EXCLUDED.expire`,
+        [sid, JSON.stringify(sessionData), expire]
+      );
+      if (callback) callback(null);
+    } catch (err) { if (callback) callback(err); }
+  }
+
+  async destroy(sid, callback) {
+    try {
+      await sqlRun('DELETE FROM express_sessions WHERE sid = ?', [sid]);
+      if (callback) callback(null);
+    } catch (err) { if (callback) callback(err); }
+  }
+
+  async touch(sid, sessionData, callback) {
+    const maxAge = sessionData.cookie?.maxAge ?? 3600000;
+    const expire = new Date(Date.now() + maxAge).toISOString();
+    try {
+      await sqlRun('UPDATE express_sessions SET expire = ? WHERE sid = ?', [expire, sid]);
+      if (callback) callback(null);
+    } catch (err) { if (callback) callback(err); }
+  }
+}
+
 const app = express();
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
@@ -27,13 +70,17 @@ app.use((req, res, next) => {
 
 app.use(pinoHttp({ logger }));
 app.use(helmet());
-app.use(cors({ origin: ['http://localhost:4200', 'http://localhost:4000'], credentials: true }));
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
+  : ['http://localhost:4200', 'http://localhost:4000'];
+app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(express.json());
 app.use(session({
+  store: new NeonSessionStore(),
   secret: process.env.SESSION_SECRET || 'carddemo-dev-secret',
   resave: false,
   saveUninitialized: false,
-  cookie: { maxAge: 1000 * 60 * 60 }
+  cookie: { maxAge: 1000 * 60 * 60, sameSite: 'none', secure: process.env.NODE_ENV === 'production' }
 }));
 
 app.get('/api-docs.json', (_req, res) => {

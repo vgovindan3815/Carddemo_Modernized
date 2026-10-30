@@ -442,6 +442,14 @@ async function migrate() {
     `CREATE INDEX IF NOT EXISTS idx_stage_statement_lines_job_run_id ON stage_statement_lines(job_run_id)`,
     `CREATE INDEX IF NOT EXISTS idx_stage_statement_lines_acct_id ON stage_statement_lines(acct_id)`,
 
+    `CREATE TABLE IF NOT EXISTS express_sessions (
+      sid VARCHAR NOT NULL PRIMARY KEY,
+      sess JSONB NOT NULL,
+      expire TIMESTAMPTZ NOT NULL
+    )`,
+
+    `CREATE INDEX IF NOT EXISTS express_sessions_expire_idx ON express_sessions (expire)`,
+
     `CREATE OR REPLACE FUNCTION set_account_created_at()
     RETURNS TRIGGER AS $$
     BEGIN

@@ -1,0 +1,22 @@
+{
+  "buildCommand": "cd frontend && npm install && npm run build -- --configuration production && cd ../backend && npm install",
+  "outputDirectory": "frontend/dist/frontend/browser",
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 60
+    },
+    "api/cron/process-jobs.js": {
+      "maxDuration": 300
+    }
+  },
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api/index.js" },
+    { "source": "/:path*", "destination": "/index.html" }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/process-jobs",
+      "schedule": "* * * * *"
+    }
+  ]
+}
