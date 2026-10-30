@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { createHash, randomUUID } = require('crypto');
-const { db } = require('./db');
+const { sqlOne, sqlAll, sqlRun, sqlTx } = require('./db');
 
 const outputRoot = process.env.BATCH_OUTPUT_DIR || path.join(__dirname, '..', 'output');
 const acctfileDefaultInputPath = process.env.ACCTFILE_INPUT_FILE || 'data/input/acctdata.txt';
@@ -458,12 +458,12 @@ function resolveOutputDirectoryPath(outputDirPath) {
   return candidates[0];
 }
 
-function addArtifact({ jobRunId, stepRunId = null, artifactType, name, mimeType = null, storageKind, storagePath = null, sizeBytes = null, checksumSha256 = null, contentInline = null }) {
-  db.prepare(`
+async function addArtifact({ jobRunId, stepRunId = null, artifactType, name, mimeType = null, storageKind, storagePath = null, sizeBytes = null, checksumSha256 = null, contentInline = null }) {
+  await sqlRun(`
     INSERT INTO artifacts (
       artifact_id, job_run_id, step_run_id, artifact_type, name, mime_type, storage_kind, storage_path, size_bytes, checksum_sha256, content_inline, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
+  `, [
     generateArtifactId(),
     jobRunId,
     stepRunId,
@@ -476,17 +476,16 @@ function addArtifact({ jobRunId, stepRunId = null, artifactType, name, mimeType 
     checksumSha256,
     contentInline,
     nowIso()
-  );
+  ]);
 }
 
-function isCancelRequested(jobRunId) {
-  const row = db.prepare('SELECT cancel_requested_at as cancelRequestedAt FROM job_runs WHERE job_run_id = ?').get(jobRunId);
+async function isCancelRequested(jobRunId) {
+  const row = await sqlOne('SELECT cancel_requested_at as cancelRequestedAt FROM job_runs WHERE job_run_id = ?', [jobRunId]);
   return !!row?.cancelRequestedAt;
 }
 
-function markRunCancelled(jobRunId, reason = 'Cancelled by user request') {
-  db.prepare('UPDATE job_runs SET status = ?, ended_at = ?, error_summary = COALESCE(error_summary, ?), exit_code = COALESCE(exit_code, 16) WHERE job_run_id = ?')
-    .run('cancelled', nowIso(), reason, jobRunId);
+async function markRunCancelled(jobRunId, reason = 'Cancelled by user request') {
+  await sqlRun('UPDATE job_runs SET status = ?, ended_at = ?, error_summary = COALESCE(error_summary, ?), exit_code = COALESCE(exit_code, 16) WHERE job_run_id = ?', ['cancelled', nowIso(), reason, jobRunId]);
 }
 
 async function delay(ms) {
@@ -497,14 +496,14 @@ async function executePosttranStep(jobRunId, step, parameters, runDir) {
   await delay(200);
 
   const processingDate = parameters?.processingDate || nowIso().slice(0, 10);
-  const stagedRows = db.prepare(`
+  const stagedRows = await sqlAll(`
     SELECT t.tran_id as tranId, t.amount as amount, c.acct_id as acctId
     FROM transactions t
     INNER JOIN cards c ON c.card_num = t.card_num
     LEFT JOIN batch_txn_postings p ON p.tran_id = t.tran_id
     WHERE p.tran_id IS NULL
-      AND DATE(t.proc_ts) <= DATE(?)
-  `).all(processingDate);
+      AND t.proc_ts::DATE <= ?::DATE
+  `, [processingDate]);
 
   const summary = {
     processingDate,
@@ -513,17 +512,14 @@ async function executePosttranStep(jobRunId, step, parameters, runDir) {
     totalAmount: 0
   };
 
-  const tx = db.transaction(() => {
+  await sqlTx(async ({ txRun }) => {
     for (const row of stagedRows) {
-      db.prepare('UPDATE accounts SET curr_bal = curr_bal + ? WHERE acct_id = ?').run(Number(row.amount || 0), row.acctId);
-      db.prepare('INSERT INTO batch_txn_postings (tran_id, job_run_id, posted_at) VALUES (?, ?, ?)')
-        .run(row.tranId, jobRunId, nowIso());
+      await txRun('UPDATE accounts SET curr_bal = curr_bal + ? WHERE acct_id = ?', [Number(row.amount || 0), row.acctId]);
+      await txRun('INSERT INTO batch_txn_postings (tran_id, job_run_id, posted_at) VALUES (?, ?, ?)', [row.tranId, jobRunId, nowIso()]);
       summary.postedCount += 1;
       summary.totalAmount += Number(row.amount || 0);
     }
   });
-
-  tx();
 
   const reportContent = [
     `POSTTRAN SUMMARY`,
@@ -573,41 +569,35 @@ async function executeIntcalcStep(jobRunId, step, parameters, runDir) {
   const annualRate = Number(parameters?.annualRate ?? 0.18);
   const dailyRate = annualRate / 365;
 
-  const rows = db.prepare(`
+  const rows = await sqlAll(`
     SELECT a.acct_id as acctId, a.curr_bal as currBal
     FROM accounts a
     LEFT JOIN batch_interest_postings i ON i.acct_id = a.acct_id AND i.processing_date = ?
     WHERE a.curr_bal > 0 AND i.acct_id IS NULL
-  `).all(processingDate);
+  `, [processingDate]);
 
   let accruedCount = 0;
   let accruedTotal = 0;
 
-  const tx = db.transaction(() => {
+  await sqlTx(async ({ txRun, txOne }) => {
     for (const row of rows) {
       const interestAmount = Number((Number(row.currBal || 0) * dailyRate).toFixed(2));
       if (interestAmount <= 0) continue;
 
-      db.prepare('UPDATE accounts SET curr_bal = curr_bal + ?, curr_cyc_debit = COALESCE(curr_cyc_debit, 0) + ? WHERE acct_id = ?')
-        .run(interestAmount, interestAmount, row.acctId);
-
-      db.prepare('INSERT INTO batch_interest_postings (acct_id, processing_date, job_run_id, interest_amount, posted_at) VALUES (?, ?, ?, ?, ?)')
-        .run(row.acctId, processingDate, jobRunId, interestAmount, nowIso());
+      await txRun('UPDATE accounts SET curr_bal = curr_bal + ?, curr_cyc_debit = COALESCE(curr_cyc_debit, 0) + ? WHERE acct_id = ?', [interestAmount, interestAmount, row.acctId]);
+      await txRun('INSERT INTO batch_interest_postings (acct_id, processing_date, job_run_id, interest_amount, posted_at) VALUES (?, ?, ?, ?, ?)', [row.acctId, processingDate, jobRunId, interestAmount, nowIso()]);
 
       const tranId = `TXNINT${Date.now()}${String(row.acctId).slice(-4)}`;
-      const anyCard = db.prepare('SELECT card_num as cardNum FROM cards WHERE acct_id = ? ORDER BY card_num LIMIT 1').get(row.acctId);
+      const anyCard = await txOne('SELECT card_num as cardNum FROM cards WHERE acct_id = ? ORDER BY card_num LIMIT 1', [row.acctId]);
       if (anyCard?.cardNum) {
         const ts = `${processingDate}T00:00:00Z`;
-        db.prepare('INSERT INTO transactions (tran_id, tran_type_cd, tran_cat_cd, source, description, amount, merchant_id, merchant_name, merchant_city, merchant_zip, card_num, orig_ts, proc_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(tranId, 'IN', 3001, 'INTCALC', `Interest accrual ${processingDate}`, interestAmount, 0, 'BANK INTEREST', 'N/A', '00000', anyCard.cardNum, ts, ts);
+        await txRun('INSERT INTO transactions (tran_id, tran_type_cd, tran_cat_cd, source, description, amount, merchant_id, merchant_name, merchant_city, merchant_zip, card_num, orig_ts, proc_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [tranId, 'IN', 3001, 'INTCALC', `Interest accrual ${processingDate}`, interestAmount, 0, 'BANK INTEREST', 'N/A', '00000', anyCard.cardNum, ts, ts]);
       }
 
       accruedCount += 1;
       accruedTotal += interestAmount;
     }
   });
-
-  tx();
 
   const reportContent = [
     `INTCALC SUMMARY`,
@@ -656,7 +646,7 @@ async function executeTranreptStep(_jobRunId, step, parameters, runDir) {
   const startDate = parameters?.startDate || nowIso().slice(0, 10);
   const endDate = parameters?.endDate || startDate;
 
-  const rows = db.prepare(`
+  const rows = await sqlAll(`
     SELECT
       t.tran_id as tranId,
       t.proc_ts as procTs,
@@ -669,9 +659,9 @@ async function executeTranreptStep(_jobRunId, step, parameters, runDir) {
       t.merchant_city as merchantCity
     FROM transactions t
     LEFT JOIN cards c ON c.card_num = t.card_num
-    WHERE DATE(t.proc_ts) >= DATE(?) AND DATE(t.proc_ts) <= DATE(?)
-    ORDER BY DATE(t.proc_ts) ASC, t.tran_id ASC
-  `).all(startDate, endDate);
+    WHERE t.proc_ts::DATE >= ?::DATE AND t.proc_ts::DATE <= ?::DATE
+    ORDER BY t.proc_ts::DATE ASC, t.tran_id ASC
+  `, [startDate, endDate]);
 
   const totalAmount = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
   const lineItems = rows.map((row) => {
@@ -741,11 +731,11 @@ async function executeCbexportStep(jobRunId, step, parameters, runDir) {
     exportedAt: nowIso(),
     processingDate,
     entities: {
-      customers: db.prepare('SELECT * FROM customers ORDER BY cust_id').all(),
-      accounts: db.prepare('SELECT * FROM accounts ORDER BY acct_id').all(),
-      cards: db.prepare('SELECT * FROM cards ORDER BY card_num').all(),
-      cardXref: db.prepare('SELECT * FROM card_xref ORDER BY card_num').all(),
-      transactions: db.prepare('SELECT * FROM transactions ORDER BY proc_ts, tran_id').all()
+      customers: await sqlAll('SELECT * FROM customers ORDER BY cust_id', []),
+      accounts: await sqlAll('SELECT * FROM accounts ORDER BY acct_id', []),
+      cards: await sqlAll('SELECT * FROM cards ORDER BY card_num', []),
+      cardXref: await sqlAll('SELECT * FROM card_xref ORDER BY card_num', []),
+      transactions: await sqlAll('SELECT * FROM transactions ORDER BY proc_ts, tran_id', [])
     }
   };
 
@@ -758,21 +748,19 @@ async function executeCbexportStep(jobRunId, step, parameters, runDir) {
   const extractWritten = writeArtifactFile(runDir, extractName, extractContent);
 
   let recordSeq = 0;
-  const insertStage = db.prepare(`
-    INSERT INTO stage_export_records (job_run_id, source_entity, record_seq, raw_record, parsed_json, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `);
 
-  const tx = db.transaction(() => {
+  await sqlTx(async ({ txRun }) => {
     for (const [entity, rows] of Object.entries(exportSnapshot.entities)) {
       for (const row of rows) {
         recordSeq += 1;
         const raw = JSON.stringify(row);
-        insertStage.run(jobRunId, entity, recordSeq, raw, raw, nowIso());
+        await txRun(`
+          INSERT INTO stage_export_records (job_run_id, source_entity, record_seq, raw_record, parsed_json, created_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `, [jobRunId, entity, recordSeq, raw, raw, nowIso()]);
       }
     }
   });
-  tx();
 
   const summaryText = [
     'CBEXPORT SUMMARY',
@@ -828,18 +816,17 @@ async function executeCbimportStep(jobRunId, step, parameters, runDir) {
   await delay(200);
 
   const processingDate = parameters?.processingDate || nowIso().slice(0, 10);
-  const source = db.prepare(`
+  const source = await sqlOne(`
     SELECT storage_path as storagePath, name
     FROM artifacts
     WHERE artifact_type = 'extract' AND name LIKE 'CBEXPORT_%' AND storage_kind = 'file'
     ORDER BY created_at DESC
     LIMIT 1
-  `).get();
+  `, []);
 
   if (!source || !source.storagePath || !fs.existsSync(source.storagePath)) {
     const errorMsg = 'No CBEXPORT extract available for import';
-    db.prepare('INSERT INTO stage_import_errors (job_run_id, record_seq, error_message, raw_record, created_at) VALUES (?, ?, ?, ?, ?)')
-      .run(jobRunId, 0, errorMsg, null, nowIso());
+    await sqlRun('INSERT INTO stage_import_errors (job_run_id, record_seq, error_message, raw_record, created_at) VALUES (?, ?, ?, ?, ?)', [jobRunId, 0, errorMsg, null, nowIso()]);
 
     const errorReport = ['CBIMPORT SUMMARY', `processingDate=${processingDate}`, `status=warning`, `error=${errorMsg}`, `generatedAt=${nowIso()}`].join('\n');
     const reportName = `CBIMPORT_${processingDate.replace(/-/g, '')}_ERRORS.txt`;
@@ -879,8 +866,7 @@ async function executeCbimportStep(jobRunId, step, parameters, runDir) {
     payload = JSON.parse(payloadRaw);
   } catch (_error) {
     const errorMsg = 'Invalid CBEXPORT extract payload';
-    db.prepare('INSERT INTO stage_import_errors (job_run_id, record_seq, error_message, raw_record, created_at) VALUES (?, ?, ?, ?, ?)')
-      .run(jobRunId, 0, errorMsg, payloadRaw.slice(0, 8000), nowIso());
+    await sqlRun('INSERT INTO stage_import_errors (job_run_id, record_seq, error_message, raw_record, created_at) VALUES (?, ?, ?, ?, ?)', [jobRunId, 0, errorMsg, payloadRaw.slice(0, 8000), nowIso()]);
     return {
       returnCode: 8,
       message: errorMsg,
@@ -899,143 +885,111 @@ async function executeCbimportStep(jobRunId, step, parameters, runDir) {
     errors: 0
   };
 
-  const insertError = db.prepare('INSERT INTO stage_import_errors (job_run_id, record_seq, error_message, raw_record, created_at) VALUES (?, ?, ?, ?, ?)');
-
-  const tx = db.transaction(() => {
+  await sqlTx(async ({ txRun }) => {
     let seq = 0;
-
-    const upsertCustomer = db.prepare(`
-      INSERT INTO customers (cust_id, first_name, middle_name, last_name, addr_line_1, addr_line_2, addr_line_3, state_cd, country_cd, zip, phone_1, phone_2, ssn, govt_id, dob, eft_account_id, primary_holder_ind, fico_score)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(cust_id) DO UPDATE SET
-        first_name=excluded.first_name,
-        middle_name=excluded.middle_name,
-        last_name=excluded.last_name,
-        addr_line_1=excluded.addr_line_1,
-        addr_line_2=excluded.addr_line_2,
-        addr_line_3=excluded.addr_line_3,
-        state_cd=excluded.state_cd,
-        country_cd=excluded.country_cd,
-        zip=excluded.zip,
-        phone_1=excluded.phone_1,
-        phone_2=excluded.phone_2,
-        ssn=excluded.ssn,
-        govt_id=excluded.govt_id,
-        dob=excluded.dob,
-        eft_account_id=excluded.eft_account_id,
-        primary_holder_ind=excluded.primary_holder_ind,
-        fico_score=excluded.fico_score
-    `);
 
     for (const row of entities.customers || []) {
       seq += 1;
       try {
-        upsertCustomer.run(
+        await txRun(`
+          INSERT INTO customers (cust_id, first_name, middle_name, last_name, addr_line_1, addr_line_2, addr_line_3, state_cd, country_cd, zip, phone_1, phone_2, ssn, govt_id, dob, eft_account_id, primary_holder_ind, fico_score)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(cust_id) DO UPDATE SET
+            first_name=excluded.first_name, middle_name=excluded.middle_name, last_name=excluded.last_name,
+            addr_line_1=excluded.addr_line_1, addr_line_2=excluded.addr_line_2, addr_line_3=excluded.addr_line_3,
+            state_cd=excluded.state_cd, country_cd=excluded.country_cd, zip=excluded.zip,
+            phone_1=excluded.phone_1, phone_2=excluded.phone_2, ssn=excluded.ssn,
+            govt_id=excluded.govt_id, dob=excluded.dob, eft_account_id=excluded.eft_account_id,
+            primary_holder_ind=excluded.primary_holder_ind, fico_score=excluded.fico_score
+        `, [
           row.cust_id, row.first_name, row.middle_name ?? null, row.last_name,
           row.addr_line_1 ?? null, row.addr_line_2 ?? null, row.addr_line_3 ?? null,
           row.state_cd ?? null, row.country_cd ?? null, row.zip ?? null,
           row.phone_1 ?? null, row.phone_2 ?? null, row.ssn ?? null,
           row.govt_id ?? null, row.dob ?? null, row.eft_account_id ?? null,
           row.primary_holder_ind ?? null, row.fico_score ?? null
-        );
+        ]);
         imported.customers += 1;
       } catch (error) {
         imported.errors += 1;
-        insertError.run(jobRunId, seq, error.message, JSON.stringify(row), nowIso());
+        await txRun('INSERT INTO stage_import_errors (job_run_id, record_seq, error_message, raw_record, created_at) VALUES (?, ?, ?, ?, ?)', [jobRunId, seq, error.message, JSON.stringify(row), nowIso()]);
       }
     }
 
-    const upsertAccount = db.prepare(`
-      INSERT INTO accounts (acct_id, active_status, curr_bal, credit_limit, cash_credit_limit, open_date, expiration_date, reissue_date, created_at, curr_cyc_credit, curr_cyc_debit, addr_zip, group_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(acct_id) DO UPDATE SET
-        active_status=excluded.active_status,
-        curr_bal=excluded.curr_bal,
-        credit_limit=excluded.credit_limit,
-        cash_credit_limit=excluded.cash_credit_limit,
-        open_date=excluded.open_date,
-        expiration_date=excluded.expiration_date,
-        reissue_date=excluded.reissue_date,
-        curr_cyc_credit=excluded.curr_cyc_credit,
-        curr_cyc_debit=excluded.curr_cyc_debit,
-        addr_zip=excluded.addr_zip,
-        group_id=excluded.group_id
-    `);
     for (const row of entities.accounts || []) {
       seq += 1;
       try {
-        upsertAccount.run(
+        await txRun(`
+          INSERT INTO accounts (acct_id, active_status, curr_bal, credit_limit, cash_credit_limit, open_date, expiration_date, reissue_date, created_at, curr_cyc_credit, curr_cyc_debit, addr_zip, group_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(acct_id) DO UPDATE SET
+            active_status=excluded.active_status, curr_bal=excluded.curr_bal, credit_limit=excluded.credit_limit,
+            cash_credit_limit=excluded.cash_credit_limit, open_date=excluded.open_date, expiration_date=excluded.expiration_date,
+            reissue_date=excluded.reissue_date, curr_cyc_credit=excluded.curr_cyc_credit,
+            curr_cyc_debit=excluded.curr_cyc_debit, addr_zip=excluded.addr_zip, group_id=excluded.group_id
+        `, [
           row.acct_id, row.active_status, row.curr_bal, row.credit_limit, row.cash_credit_limit,
           row.open_date ?? null, row.expiration_date ?? null, row.reissue_date ?? null,
           row.created_at ?? nowIso(), row.curr_cyc_credit ?? 0, row.curr_cyc_debit ?? 0, row.addr_zip ?? null, row.group_id ?? null
-        );
+        ]);
         imported.accounts += 1;
       } catch (error) {
         imported.errors += 1;
-        insertError.run(jobRunId, seq, error.message, JSON.stringify(row), nowIso());
+        await txRun('INSERT INTO stage_import_errors (job_run_id, record_seq, error_message, raw_record, created_at) VALUES (?, ?, ?, ?, ?)', [jobRunId, seq, error.message, JSON.stringify(row), nowIso()]);
       }
     }
 
-    const upsertCard = db.prepare(`
-      INSERT INTO cards (card_num, acct_id, cvv_cd, embossed_name, expiration_date, active_status)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(card_num) DO UPDATE SET
-        acct_id=excluded.acct_id,
-        cvv_cd=excluded.cvv_cd,
-        embossed_name=excluded.embossed_name,
-        expiration_date=excluded.expiration_date,
-        active_status=excluded.active_status
-    `);
     for (const row of entities.cards || []) {
       seq += 1;
       try {
-        upsertCard.run(row.card_num, row.acct_id, row.cvv_cd ?? null, row.embossed_name ?? null, row.expiration_date ?? null, row.active_status);
+        await txRun(`
+          INSERT INTO cards (card_num, acct_id, cvv_cd, embossed_name, expiration_date, active_status)
+          VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(card_num) DO UPDATE SET
+            acct_id=excluded.acct_id, cvv_cd=excluded.cvv_cd, embossed_name=excluded.embossed_name,
+            expiration_date=excluded.expiration_date, active_status=excluded.active_status
+        `, [row.card_num, row.acct_id, row.cvv_cd ?? null, row.embossed_name ?? null, row.expiration_date ?? null, row.active_status]);
         imported.cards += 1;
       } catch (error) {
         imported.errors += 1;
-        insertError.run(jobRunId, seq, error.message, JSON.stringify(row), nowIso());
+        await txRun('INSERT INTO stage_import_errors (job_run_id, record_seq, error_message, raw_record, created_at) VALUES (?, ?, ?, ?, ?)', [jobRunId, seq, error.message, JSON.stringify(row), nowIso()]);
       }
     }
 
-    const upsertXref = db.prepare(`
-      INSERT INTO card_xref (card_num, cust_id, acct_id)
-      VALUES (?, ?, ?)
-      ON CONFLICT(card_num) DO UPDATE SET
-        cust_id=excluded.cust_id,
-        acct_id=excluded.acct_id
-    `);
     for (const row of entities.cardXref || []) {
       seq += 1;
       try {
-        upsertXref.run(row.card_num, row.cust_id, row.acct_id);
+        await txRun(`
+          INSERT INTO card_xref (card_num, cust_id, acct_id)
+          VALUES (?, ?, ?)
+          ON CONFLICT(card_num) DO UPDATE SET cust_id=excluded.cust_id, acct_id=excluded.acct_id
+        `, [row.card_num, row.cust_id, row.acct_id]);
         imported.cardXref += 1;
       } catch (error) {
         imported.errors += 1;
-        insertError.run(jobRunId, seq, error.message, JSON.stringify(row), nowIso());
+        await txRun('INSERT INTO stage_import_errors (job_run_id, record_seq, error_message, raw_record, created_at) VALUES (?, ?, ?, ?, ?)', [jobRunId, seq, error.message, JSON.stringify(row), nowIso()]);
       }
     }
 
-    const insertTxn = db.prepare(`
-      INSERT OR IGNORE INTO transactions (tran_id, tran_type_cd, tran_cat_cd, source, description, amount, merchant_id, merchant_name, merchant_city, merchant_zip, card_num, orig_ts, proc_ts)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
     for (const row of entities.transactions || []) {
       seq += 1;
       try {
-        insertTxn.run(
+        await txRun(`
+          INSERT INTO transactions (tran_id, tran_type_cd, tran_cat_cd, source, description, amount, merchant_id, merchant_name, merchant_city, merchant_zip, card_num, orig_ts, proc_ts)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(tran_id) DO NOTHING
+        `, [
           row.tran_id, row.tran_type_cd, row.tran_cat_cd, row.source, row.description,
           row.amount, row.merchant_id, row.merchant_name, row.merchant_city, row.merchant_zip,
           row.card_num, row.orig_ts, row.proc_ts
-        );
+        ]);
         imported.transactions += 1;
       } catch (error) {
         imported.errors += 1;
-        insertError.run(jobRunId, seq, error.message, JSON.stringify(row), nowIso());
+        await txRun('INSERT INTO stage_import_errors (job_run_id, record_seq, error_message, raw_record, created_at) VALUES (?, ?, ?, ?, ?)', [jobRunId, seq, error.message, JSON.stringify(row), nowIso()]);
       }
     }
   });
-
-  tx();
 
   const summaryText = [
     'CBIMPORT SUMMARY',
@@ -1086,7 +1040,7 @@ async function executeCreastmtStep(jobRunId, step, parameters, runDir) {
   const processingDate = parameters?.processingDate || nowIso().slice(0, 10);
   const monthStart = `${processingDate.slice(0, 8)}01`;
 
-  const accountRows = db.prepare(`
+  const accountRows = await sqlAll(`
     SELECT
       a.acct_id as acctId,
       a.curr_bal as currentBalance,
@@ -1096,22 +1050,22 @@ async function executeCreastmtStep(jobRunId, step, parameters, runDir) {
     FROM accounts a
     LEFT JOIN card_xref x ON x.acct_id = a.acct_id
     LEFT JOIN customers c ON c.cust_id = x.cust_id
-    GROUP BY a.acct_id
+    GROUP BY a.acct_id, a.curr_bal, c.first_name, c.last_name, x.cust_id
     ORDER BY a.acct_id
-  `).all();
+  `, []);
 
   const statementLines = [];
   const htmlSections = [];
   let lineSeq = 0;
 
   for (const acct of accountRows) {
-    const txns = db.prepare(`
+    const txns = await sqlAll(`
       SELECT t.tran_id as tranId, t.proc_ts as procTs, t.description as description, t.amount as amount, t.tran_type_cd as tranTypeCd
       FROM transactions t
       INNER JOIN cards cd ON cd.card_num = t.card_num
-      WHERE cd.acct_id = ? AND DATE(t.proc_ts) >= DATE(?) AND DATE(t.proc_ts) <= DATE(?)
+      WHERE cd.acct_id = ? AND t.proc_ts::DATE >= ?::DATE AND t.proc_ts::DATE <= ?::DATE
       ORDER BY t.proc_ts ASC, t.tran_id ASC
-    `).all(acct.acctId, monthStart, processingDate);
+    `, [acct.acctId, monthStart, processingDate]);
 
     const holder = `${acct.firstName || 'N/A'} ${acct.lastName || ''}`.trim();
     const acctTotal = txns.reduce((sum, row) => sum + Number(row.amount || 0), 0);
@@ -1119,21 +1073,19 @@ async function executeCreastmtStep(jobRunId, step, parameters, runDir) {
     const header = `STATEMENT ACCT=${acct.acctId} HOLDER=${holder} PERIOD=${monthStart}..${processingDate} TXN_COUNT=${txns.length} TXN_TOTAL=${acctTotal.toFixed(2)} CURR_BAL=${Number(acct.currentBalance || 0).toFixed(2)}`;
     statementLines.push(header);
     lineSeq += 1;
-    db.prepare('INSERT INTO stage_statement_lines (job_run_id, acct_id, line_seq, line_text, created_at) VALUES (?, ?, ?, ?, ?)')
-      .run(jobRunId, acct.acctId, lineSeq, header, nowIso());
+    await sqlRun('INSERT INTO stage_statement_lines (job_run_id, acct_id, line_seq, line_text, created_at) VALUES (?, ?, ?, ?, ?)', [jobRunId, acct.acctId, lineSeq, header, nowIso()]);
 
-    const detailLines = txns.map((txn) => {
+    const detailLines = [];
+    for (const txn of txns) {
       const line = `${String(txn.procTs || '').slice(0, 10)} | ${String(txn.tranId || '').padEnd(18, ' ')} | ${String(txn.tranTypeCd || '').padEnd(4, ' ')} | ${Number(txn.amount || 0).toFixed(2).padStart(12, ' ')} | ${String(txn.description || '').slice(0, 60)}`;
       lineSeq += 1;
-      db.prepare('INSERT INTO stage_statement_lines (job_run_id, acct_id, line_seq, line_text, created_at) VALUES (?, ?, ?, ?, ?)')
-        .run(jobRunId, acct.acctId, lineSeq, line, nowIso());
-      return line;
-    });
+      await sqlRun('INSERT INTO stage_statement_lines (job_run_id, acct_id, line_seq, line_text, created_at) VALUES (?, ?, ?, ?, ?)', [jobRunId, acct.acctId, lineSeq, line, nowIso()]);
+      detailLines.push(line);
+    }
     if (!detailLines.length) {
       lineSeq += 1;
       const noneLine = 'NO TRANSACTIONS FOR PERIOD';
-      db.prepare('INSERT INTO stage_statement_lines (job_run_id, acct_id, line_seq, line_text, created_at) VALUES (?, ?, ?, ?, ?)')
-        .run(jobRunId, acct.acctId, lineSeq, noneLine, nowIso());
+      await sqlRun('INSERT INTO stage_statement_lines (job_run_id, acct_id, line_seq, line_text, created_at) VALUES (?, ?, ?, ?, ?)', [jobRunId, acct.acctId, lineSeq, noneLine, nowIso()]);
       detailLines.push(noneLine);
     }
 
@@ -1225,42 +1177,23 @@ async function executeAcctfileStep(_jobRunId, step, parameters, runDir) {
     upsertSummary.sourceFile = parsedInput.resolvedPath;
     upsertSummary.inputRecords = parsedInput.mappedRecords.length;
 
-    const existsStmt = db.prepare('SELECT acct_id FROM accounts WHERE acct_id = ?');
-    const upsertStmt = db.prepare(`
-      INSERT INTO accounts (acct_id, active_status, curr_bal, credit_limit, cash_credit_limit, open_date, expiration_date, reissue_date, curr_cyc_credit, curr_cyc_debit, addr_zip, group_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(acct_id) DO UPDATE SET
-        active_status=excluded.active_status,
-        curr_bal=excluded.curr_bal,
-        credit_limit=excluded.credit_limit,
-        cash_credit_limit=excluded.cash_credit_limit,
-        open_date=excluded.open_date,
-        expiration_date=excluded.expiration_date,
-        reissue_date=excluded.reissue_date,
-        curr_cyc_credit=excluded.curr_cyc_credit,
-        curr_cyc_debit=excluded.curr_cyc_debit,
-        addr_zip=excluded.addr_zip,
-        group_id=excluded.group_id
-    `);
-
-    const tx = db.transaction(() => {
+    await sqlTx(async ({ txRun, txOne }) => {
       for (const row of parsedInput.mappedRecords) {
         try {
-          const existed = !!existsStmt.get(row.acctId);
-          upsertStmt.run(
-            row.acctId,
-            row.activeStatus,
-            row.currBal,
-            row.creditLimit,
-            row.cashCreditLimit,
-            row.openDate,
-            row.expirationDate,
-            row.reissueDate,
-            row.currCycCredit,
-            row.currCycDebit,
-            row.addrZip,
-            row.groupId
-          );
+          const existed = !!(await txOne('SELECT acct_id FROM accounts WHERE acct_id = ?', [row.acctId]));
+          await txRun(`
+            INSERT INTO accounts (acct_id, active_status, curr_bal, credit_limit, cash_credit_limit, open_date, expiration_date, reissue_date, curr_cyc_credit, curr_cyc_debit, addr_zip, group_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(acct_id) DO UPDATE SET
+              active_status=excluded.active_status, curr_bal=excluded.curr_bal, credit_limit=excluded.credit_limit,
+              cash_credit_limit=excluded.cash_credit_limit, open_date=excluded.open_date, expiration_date=excluded.expiration_date,
+              reissue_date=excluded.reissue_date, curr_cyc_credit=excluded.curr_cyc_credit,
+              curr_cyc_debit=excluded.curr_cyc_debit, addr_zip=excluded.addr_zip, group_id=excluded.group_id
+          `, [
+            row.acctId, row.activeStatus, row.currBal, row.creditLimit, row.cashCreditLimit,
+            row.openDate, row.expirationDate, row.reissueDate, row.currCycCredit, row.currCycDebit,
+            row.addrZip, row.groupId
+          ]);
           if (existed) {
             upsertSummary.updatedAccounts += 1;
           } else {
@@ -1271,15 +1204,13 @@ async function executeAcctfileStep(_jobRunId, step, parameters, runDir) {
         }
       }
     });
-
-    tx();
   } else if (explicitInputFilePath) {
     throw new Error(`Input file not found: ${explicitInputFilePath}`);
   }
 
-  const totalAccounts = db.prepare('SELECT COUNT(*) as count FROM accounts').get().count;
-  const activeAccounts = db.prepare("SELECT COUNT(*) as count FROM accounts WHERE active_status = 'Y'").get().count;
-  const balanceSummary = db.prepare('SELECT COALESCE(SUM(curr_bal), 0) as totalBalance FROM accounts').get();
+  const totalAccounts = Number((await sqlOne('SELECT COUNT(*) as count FROM accounts', [])).count);
+  const activeAccounts = Number((await sqlOne("SELECT COUNT(*) as count FROM accounts WHERE active_status = 'Y'", [])).count);
+  const balanceSummary = await sqlOne('SELECT COALESCE(SUM(curr_bal), 0) as totalBalance FROM accounts', []);
 
   const manifest = {
     utilityJob: 'ACCTFILE',
@@ -1368,33 +1299,17 @@ async function executeCardfileStep(_jobRunId, step, parameters, runDir) {
     upsertSummary.cardInputRecords = cardRecords.mappedRecords.length;
     upsertSummary.xrefInputRecords = xrefRecords.mappedRecords.length;
 
-    const existsCardStmt = db.prepare('SELECT card_num FROM cards WHERE card_num = ?');
-    const existsXrefStmt = db.prepare('SELECT card_num FROM card_xref WHERE card_num = ?');
-
-    const upsertCardStmt = db.prepare(`
-      INSERT INTO cards (card_num, acct_id, cvv_cd, embossed_name, expiration_date, active_status)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(card_num) DO UPDATE SET
-        acct_id=excluded.acct_id,
-        cvv_cd=excluded.cvv_cd,
-        embossed_name=excluded.embossed_name,
-        expiration_date=excluded.expiration_date,
-        active_status=excluded.active_status
-    `);
-
-    const upsertXrefStmt = db.prepare(`
-      INSERT INTO card_xref (card_num, cust_id, acct_id)
-      VALUES (?, ?, ?)
-      ON CONFLICT(card_num) DO UPDATE SET
-        cust_id=excluded.cust_id,
-        acct_id=excluded.acct_id
-    `);
-
-    const tx = db.transaction(() => {
+    await sqlTx(async ({ txRun, txOne }) => {
       for (const row of cardRecords.mappedRecords) {
         try {
-          const existed = !!existsCardStmt.get(row.cardNum);
-          upsertCardStmt.run(row.cardNum, row.acctId, row.cvvCd, row.embossedName, row.expirationDate, row.activeStatus);
+          const existed = !!(await txOne('SELECT card_num FROM cards WHERE card_num = ?', [row.cardNum]));
+          await txRun(`
+            INSERT INTO cards (card_num, acct_id, cvv_cd, embossed_name, expiration_date, active_status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(card_num) DO UPDATE SET
+              acct_id=excluded.acct_id, cvv_cd=excluded.cvv_cd, embossed_name=excluded.embossed_name,
+              expiration_date=excluded.expiration_date, active_status=excluded.active_status
+          `, [row.cardNum, row.acctId, row.cvvCd, row.embossedName, row.expirationDate, row.activeStatus]);
           if (existed) {
             upsertSummary.updatedCards += 1;
           } else {
@@ -1407,8 +1322,12 @@ async function executeCardfileStep(_jobRunId, step, parameters, runDir) {
 
       for (const row of xrefRecords.mappedRecords) {
         try {
-          const existed = !!existsXrefStmt.get(row.cardNum);
-          upsertXrefStmt.run(row.cardNum, row.custId, row.acctId);
+          const existed = !!(await txOne('SELECT card_num FROM card_xref WHERE card_num = ?', [row.cardNum]));
+          await txRun(`
+            INSERT INTO card_xref (card_num, cust_id, acct_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(card_num) DO UPDATE SET cust_id=excluded.cust_id, acct_id=excluded.acct_id
+          `, [row.cardNum, row.custId, row.acctId]);
           if (existed) {
             upsertSummary.updatedXref += 1;
           } else {
@@ -1419,16 +1338,14 @@ async function executeCardfileStep(_jobRunId, step, parameters, runDir) {
         }
       }
     });
-
-    tx();
   } else if (explicitCardInputPath || explicitXrefInputPath) {
     throw new Error(`Input file not found: ${explicitCardInputPath || explicitXrefInputPath}`);
   }
 
-  const totalCards = db.prepare('SELECT COUNT(*) as count FROM cards').get().count;
-  const activeCards = db.prepare("SELECT COUNT(*) as count FROM cards WHERE active_status = 'Y'").get().count;
-  const orphanCards = db.prepare('SELECT COUNT(*) as count FROM cards c LEFT JOIN accounts a ON a.acct_id = c.acct_id WHERE a.acct_id IS NULL').get().count;
-  const missingXref = db.prepare('SELECT COUNT(*) as count FROM cards c LEFT JOIN card_xref x ON x.card_num = c.card_num WHERE x.card_num IS NULL').get().count;
+  const totalCards = Number((await sqlOne('SELECT COUNT(*) as count FROM cards', [])).count);
+  const activeCards = Number((await sqlOne("SELECT COUNT(*) as count FROM cards WHERE active_status = 'Y'", [])).count);
+  const orphanCards = Number((await sqlOne('SELECT COUNT(*) as count FROM cards c LEFT JOIN accounts a ON a.acct_id = c.acct_id WHERE a.acct_id IS NULL', [])).count);
+  const missingXref = Number((await sqlOne('SELECT COUNT(*) as count FROM cards c LEFT JOIN card_xref x ON x.card_num = c.card_num WHERE x.card_num IS NULL', [])).count);
 
   const manifest = {
     utilityJob: 'CARDFILE',
@@ -1514,54 +1431,26 @@ async function executeCustfileStep(_jobRunId, step, parameters, runDir) {
     upsertSummary.sourceFile = parsedInput.resolvedPath;
     upsertSummary.inputRecords = parsedInput.mappedRecords.length;
 
-    const existsStmt = db.prepare('SELECT cust_id FROM customers WHERE cust_id = ?');
-    const upsertStmt = db.prepare(`
-      INSERT INTO customers (cust_id, first_name, middle_name, last_name, addr_line_1, addr_line_2, addr_line_3, state_cd, country_cd, zip, phone_1, phone_2, ssn, govt_id, dob, eft_account_id, primary_holder_ind, fico_score)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(cust_id) DO UPDATE SET
-        first_name=excluded.first_name,
-        middle_name=excluded.middle_name,
-        last_name=excluded.last_name,
-        addr_line_1=excluded.addr_line_1,
-        addr_line_2=excluded.addr_line_2,
-        addr_line_3=excluded.addr_line_3,
-        state_cd=excluded.state_cd,
-        country_cd=excluded.country_cd,
-        zip=excluded.zip,
-        phone_1=excluded.phone_1,
-        phone_2=excluded.phone_2,
-        ssn=excluded.ssn,
-        govt_id=excluded.govt_id,
-        dob=excluded.dob,
-        eft_account_id=excluded.eft_account_id,
-        primary_holder_ind=excluded.primary_holder_ind,
-        fico_score=excluded.fico_score
-    `);
-
-    const tx = db.transaction(() => {
+    await sqlTx(async ({ txRun, txOne }) => {
       for (const row of parsedInput.mappedRecords) {
         try {
-          const existed = !!existsStmt.get(row.custId);
-          upsertStmt.run(
-            row.custId,
-            row.firstName,
-            row.middleName,
-            row.lastName,
-            row.addrLine1,
-            row.addrLine2,
-            row.addrLine3,
-            row.stateCd,
-            row.countryCd,
-            row.zip,
-            row.phone1,
-            row.phone2,
-            row.ssn,
-            row.govtId,
-            row.dob,
-            row.eftAccountId,
-            row.primaryHolderInd,
-            row.ficoScore
-          );
+          const existed = !!(await txOne('SELECT cust_id FROM customers WHERE cust_id = ?', [row.custId]));
+          await txRun(`
+            INSERT INTO customers (cust_id, first_name, middle_name, last_name, addr_line_1, addr_line_2, addr_line_3, state_cd, country_cd, zip, phone_1, phone_2, ssn, govt_id, dob, eft_account_id, primary_holder_ind, fico_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cust_id) DO UPDATE SET
+              first_name=excluded.first_name, middle_name=excluded.middle_name, last_name=excluded.last_name,
+              addr_line_1=excluded.addr_line_1, addr_line_2=excluded.addr_line_2, addr_line_3=excluded.addr_line_3,
+              state_cd=excluded.state_cd, country_cd=excluded.country_cd, zip=excluded.zip,
+              phone_1=excluded.phone_1, phone_2=excluded.phone_2, ssn=excluded.ssn,
+              govt_id=excluded.govt_id, dob=excluded.dob, eft_account_id=excluded.eft_account_id,
+              primary_holder_ind=excluded.primary_holder_ind, fico_score=excluded.fico_score
+          `, [
+            row.custId, row.firstName, row.middleName, row.lastName,
+            row.addrLine1, row.addrLine2, row.addrLine3, row.stateCd, row.countryCd, row.zip,
+            row.phone1, row.phone2, row.ssn, row.govtId, row.dob, row.eftAccountId,
+            row.primaryHolderInd, row.ficoScore
+          ]);
           if (existed) {
             upsertSummary.updatedCustomers += 1;
           } else {
@@ -1572,16 +1461,14 @@ async function executeCustfileStep(_jobRunId, step, parameters, runDir) {
         }
       }
     });
-
-    tx();
   } else if (explicitInputFilePath) {
     throw new Error(`Input file not found: ${explicitInputFilePath}`);
   }
 
-  const totalCustomers = db.prepare('SELECT COUNT(*) as count FROM customers').get().count;
-  const primaryHolders = db.prepare("SELECT COUNT(*) as count FROM customers WHERE primary_holder_ind = 'Y'").get().count;
-  const avgFico = db.prepare('SELECT COALESCE(AVG(fico_score), 0) as avgFico FROM customers').get();
-  const linkedCustomers = db.prepare('SELECT COUNT(DISTINCT cust_id) as count FROM card_xref').get().count;
+  const totalCustomers = Number((await sqlOne('SELECT COUNT(*) as count FROM customers', [])).count);
+  const primaryHolders = Number((await sqlOne("SELECT COUNT(*) as count FROM customers WHERE primary_holder_ind = 'Y'", [])).count);
+  const avgFico = await sqlOne('SELECT COALESCE(AVG(fico_score), 0) as avgFico FROM customers', []);
+  const linkedCustomers = Number((await sqlOne('SELECT COUNT(DISTINCT cust_id) as count FROM card_xref', [])).count);
 
   const manifest = {
     utilityJob: 'CUSTFILE',
@@ -1641,12 +1528,12 @@ async function executeTranbkpStep(_jobRunId, step, parameters, runDir) {
 
   const processingDate = parameters?.processingDate || nowIso().slice(0, 10);
   const outputDirPath = parameters?.outputDirPath ? String(parameters.outputDirPath).trim() : '';
-  const rows = db.prepare(`
+  const rows = await sqlAll(`
     SELECT tran_id as tranId, proc_ts as procTs, card_num as cardNum, tran_type_cd as tranTypeCd, amount, description
     FROM transactions
-    WHERE DATE(proc_ts) <= DATE(?)
+    WHERE proc_ts::DATE <= ?::DATE
     ORDER BY proc_ts ASC, tran_id ASC
-  `).all(processingDate);
+  `, [processingDate]);
 
   const backupPayload = {
     job: 'TRANBKP',
@@ -1775,8 +1662,8 @@ async function executeStep(jobRunId, jobName, step, parameters, runDir) {
   return executeDefaultStep(jobName, step, parameters, runDir);
 }
 
-function getJobDefinition(jobName) {
-  const row = db.prepare('SELECT * FROM jobs WHERE job_name = ?').get(jobName);
+async function getJobDefinition(jobName) {
+  const row = await sqlOne('SELECT * FROM jobs WHERE job_name = ?', [jobName]);
   if (!row) return null;
   const definition = parseJson(row.job_definition_json, { steps: [] });
   return {
@@ -1787,13 +1674,13 @@ function getJobDefinition(jobName) {
   };
 }
 
-function submitJob({ jobName, runMode, parameters, submittedBy, correlationId, restartOfJobRunId = null }) {
-  const job = getJobDefinition(jobName);
+async function submitJob({ jobName, runMode, parameters, submittedBy, correlationId, restartOfJobRunId = null }) {
+  const job = await getJobDefinition(jobName);
   if (!job || !job.enabled) {
     return null;
   }
 
-  const hasRunning = db.prepare('SELECT job_run_id FROM job_runs WHERE job_name = ? AND status IN (\'queued\', \'running\')').get(jobName);
+  const hasRunning = await sqlOne('SELECT job_run_id FROM job_runs WHERE job_name = ? AND status IN (\'queued\', \'running\')', [jobName]);
   if (hasRunning) {
     const error = new Error(`Job ${jobName} already running`);
     error.code = 'JOB_ALREADY_RUNNING';
@@ -1804,11 +1691,11 @@ function submitJob({ jobName, runMode, parameters, submittedBy, correlationId, r
   const runDir = path.join(outputRoot, jobRunId);
   fs.mkdirSync(runDir, { recursive: true });
 
-  db.prepare(`
+  await sqlRun(`
     INSERT INTO job_runs (
       job_run_id, job_name, submitted_at, submitted_by, run_mode, parameters_json, status, correlation_id, output_dir, restart_of_job_run_id
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
+  `, [
     jobRunId,
     jobName,
     nowIso(),
@@ -1819,24 +1706,24 @@ function submitJob({ jobName, runMode, parameters, submittedBy, correlationId, r
     correlationId || null,
     runDir,
     restartOfJobRunId
-  );
+  ]);
 
   queueRunExecution(jobRunId);
 
   return { jobRunId, jobName, status: 'queued' };
 }
 
-function getRestartStartStepSeq(jobRunId, restartOfJobRunId, restartMode) {
+async function getRestartStartStepSeq(jobRunId, restartOfJobRunId, restartMode) {
   if (!restartOfJobRunId || restartMode !== 'resume-from-failed-step') {
     return 1;
   }
-  const failedStep = db.prepare(`
+  const failedStep = await sqlOne(`
     SELECT step_seq as stepSeq
     FROM job_run_steps
     WHERE job_run_id = ? AND status = 'failed'
     ORDER BY step_seq ASC
     LIMIT 1
-  `).get(restartOfJobRunId);
+  `, [restartOfJobRunId]);
   return failedStep?.stepSeq || 1;
 }
 
@@ -1851,20 +1738,19 @@ function queueRunExecution(jobRunId) {
 async function executeJobRun(jobRunId) {
   if (runningJobRuns.has(jobRunId)) return;
 
-  const run = db.prepare('SELECT * FROM job_runs WHERE job_run_id = ?').get(jobRunId);
+  const run = await sqlOne('SELECT * FROM job_runs WHERE job_run_id = ?', [jobRunId]);
   if (!run || run.status !== 'queued') return;
 
   if (run.cancel_requested_at) {
-    markRunCancelled(jobRunId, run.cancel_reason || 'Cancelled before start');
+    await markRunCancelled(jobRunId, run.cancel_reason || 'Cancelled before start');
     return;
   }
 
   runningJobRuns.add(jobRunId);
 
-  const job = getJobDefinition(run.job_name);
+  const job = await getJobDefinition(run.job_name);
   if (!job) {
-    db.prepare('UPDATE job_runs SET status = ?, started_at = ?, ended_at = ?, exit_code = ?, error_summary = ? WHERE job_run_id = ?')
-      .run('failed', nowIso(), nowIso(), 16, 'Job definition missing', jobRunId);
+    await sqlRun('UPDATE job_runs SET status = ?, started_at = ?, ended_at = ?, exit_code = ?, error_summary = ? WHERE job_run_id = ?', ['failed', nowIso(), nowIso(), 16, 'Job definition missing', jobRunId]);
     runningJobRuns.delete(jobRunId);
     return;
   }
@@ -1874,9 +1760,9 @@ async function executeJobRun(jobRunId) {
   fs.mkdirSync(runDir, { recursive: true });
   const restartMeta = params?.__restart || {};
   const restartMode = restartMeta.mode || 'rerun-all';
-  const startStepSeq = getRestartStartStepSeq(jobRunId, run.restart_of_job_run_id, restartMode);
+  const startStepSeq = await getRestartStartStepSeq(jobRunId, run.restart_of_job_run_id, restartMode);
 
-  db.prepare('UPDATE job_runs SET status = ?, started_at = ? WHERE job_run_id = ?').run('running', nowIso(), jobRunId);
+  await sqlRun('UPDATE job_runs SET status = ?, started_at = ? WHERE job_run_id = ?', ['running', nowIso(), jobRunId]);
 
   const combinedLogs = [];
   let highestRc = 0;
@@ -1891,23 +1777,17 @@ async function executeJobRun(jobRunId) {
       const conditionExpr = step.condition || null;
 
       if (stepSeq < startStepSeq) {
-        db.prepare(`
+        await sqlRun(`
           INSERT INTO job_run_steps (
             step_run_id, job_run_id, step_seq, step_name, legacy_exec_type, legacy_exec_target,
             status, condition_expr, started_at, ended_at, return_code, message
           ) VALUES (?, ?, ?, ?, ?, ?, 'skipped', ?, ?, ?, 0, ?)
-        `).run(
-          stepRunId,
-          jobRunId,
-          stepSeq,
-          step.name,
-          toStepTypeLabel(step.type),
-          step.target,
-          conditionExpr,
-          nowIso(),
-          nowIso(),
+        `, [
+          stepRunId, jobRunId, stepSeq, step.name,
+          toStepTypeLabel(step.type), step.target,
+          conditionExpr, nowIso(), nowIso(),
           `Restart mode ${restartMode}: skipped before resume step ${startStepSeq}`
-        );
+        ]);
         previousRc = 0;
         combinedLogs.push(`[${nowIso()}] ${step.name} skipped due to restart mode ${restartMode}`);
         continue;
@@ -1915,49 +1795,38 @@ async function executeJobRun(jobRunId) {
 
       const shouldSkip = shouldSkipStep(conditionExpr, previousRc);
       if (shouldSkip) {
-        db.prepare(`
+        await sqlRun(`
           INSERT INTO job_run_steps (
             step_run_id, job_run_id, step_seq, step_name, legacy_exec_type, legacy_exec_target,
             status, condition_expr, started_at, ended_at, return_code, message
           ) VALUES (?, ?, ?, ?, ?, ?, 'skipped', ?, ?, ?, NULL, ?)
-        `).run(
-          stepRunId,
-          jobRunId,
-          stepSeq,
-          step.name,
-          toStepTypeLabel(step.type),
-          step.target,
-          conditionExpr,
-          nowIso(),
-          nowIso(),
+        `, [
+          stepRunId, jobRunId, stepSeq, step.name,
+          toStepTypeLabel(step.type), step.target,
+          conditionExpr, nowIso(), nowIso(),
           `Skipped by condition ${conditionExpr}`
-        );
+        ]);
         combinedLogs.push(`[${nowIso()}] ${step.name} skipped by condition ${conditionExpr}`);
         continue;
       }
 
-      db.prepare(`
+      await sqlRun(`
         INSERT INTO job_run_steps (
           step_run_id, job_run_id, step_seq, step_name, legacy_exec_type, legacy_exec_target,
           status, condition_expr, started_at
         ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)
-      `).run(
-        stepRunId,
-        jobRunId,
-        stepSeq,
-        step.name,
-        toStepTypeLabel(step.type),
-        step.target,
-        conditionExpr,
-        nowIso()
-      );
+      `, [
+        stepRunId, jobRunId, stepSeq, step.name,
+        toStepTypeLabel(step.type), step.target,
+        conditionExpr, nowIso()
+      ]);
 
       const retryPolicy = getStepRetryPolicy(step);
       let result = null;
       let attempts = 0;
 
       while (attempts < retryPolicy.maxAttempts) {
-        if (isCancelRequested(jobRunId)) {
+        if (await isCancelRequested(jobRunId)) {
           result = {
             returnCode: 16,
             message: `Step cancelled before execution attempt ${attempts + 1}`,
@@ -1993,15 +1862,14 @@ async function executeJobRun(jobRunId) {
       previousRc = result.returnCode;
       highestRc = Math.max(highestRc, result.returnCode);
 
-      db.prepare('UPDATE job_run_steps SET status = ?, ended_at = ?, return_code = ?, message = ? WHERE step_run_id = ?')
-        .run(stepStatus, nowIso(), result.returnCode, result.message, stepRunId);
+      await sqlRun('UPDATE job_run_steps SET status = ?, ended_at = ?, return_code = ?, message = ? WHERE step_run_id = ?', [stepStatus, nowIso(), result.returnCode, result.message, stepRunId]);
 
       combinedLogs.push(result.logLine);
 
       for (const artifact of result.generatedArtifacts) {
         if (artifact.content !== undefined) {
           const written = writeArtifactFile(runDir, artifact.name, artifact.content);
-          addArtifact({
+          await addArtifact({
             jobRunId,
             stepRunId,
             artifactType: artifact.artifactType,
@@ -2013,7 +1881,7 @@ async function executeJobRun(jobRunId) {
             checksumSha256: written.checksumSha256
           });
         } else {
-          addArtifact({
+          await addArtifact({
             jobRunId,
             stepRunId,
             artifactType: artifact.artifactType,
@@ -2028,8 +1896,8 @@ async function executeJobRun(jobRunId) {
       }
 
       if (result.returnCode > 4) {
-        if (isCancelRequested(jobRunId)) {
-          markRunCancelled(jobRunId, 'Cancelled while running');
+        if (await isCancelRequested(jobRunId)) {
+          await markRunCancelled(jobRunId, 'Cancelled while running');
           failed = false;
           break;
         }
@@ -2037,15 +1905,15 @@ async function executeJobRun(jobRunId) {
         break;
       }
 
-      if (isCancelRequested(jobRunId)) {
-        markRunCancelled(jobRunId, 'Cancelled while running');
+      if (await isCancelRequested(jobRunId)) {
+        await markRunCancelled(jobRunId, 'Cancelled while running');
         failed = false;
         break;
       }
     }
 
     const combinedLogText = combinedLogs.join('\n');
-    addArtifact({
+    await addArtifact({
       jobRunId,
       artifactType: 'log',
       name: 'job.log',
@@ -2056,27 +1924,25 @@ async function executeJobRun(jobRunId) {
       checksumSha256: checksum(combinedLogText)
     });
 
-    const latestRun = db.prepare('SELECT status FROM job_runs WHERE job_run_id = ?').get(jobRunId);
+    const latestRun = await sqlOne('SELECT status FROM job_runs WHERE job_run_id = ?', [jobRunId]);
     if (latestRun?.status !== 'cancelled') {
-      db.prepare('UPDATE job_runs SET status = ?, ended_at = ?, exit_code = ?, error_summary = ? WHERE job_run_id = ?')
-        .run(
-          failed ? 'failed' : 'succeeded',
-          nowIso(),
-          highestRc,
-          failed ? `Step failure detected with RC=${highestRc}` : null,
-          jobRunId
-        );
+      await sqlRun('UPDATE job_runs SET status = ?, ended_at = ?, exit_code = ?, error_summary = ? WHERE job_run_id = ?', [
+        failed ? 'failed' : 'succeeded',
+        nowIso(),
+        highestRc,
+        failed ? `Step failure detected with RC=${highestRc}` : null,
+        jobRunId
+      ]);
     }
   } catch (error) {
-    db.prepare('UPDATE job_runs SET status = ?, ended_at = ?, exit_code = ?, error_summary = ? WHERE job_run_id = ?')
-      .run('failed', nowIso(), 16, error.message || 'System error', jobRunId);
+    await sqlRun('UPDATE job_runs SET status = ?, ended_at = ?, exit_code = ?, error_summary = ? WHERE job_run_id = ?', ['failed', nowIso(), 16, error.message || 'System error', jobRunId]);
   } finally {
     runningJobRuns.delete(jobRunId);
   }
 }
 
-function cancelJobRun({ jobRunId, requestedBy, reason }) {
-  const run = db.prepare('SELECT job_run_id, status FROM job_runs WHERE job_run_id = ?').get(jobRunId);
+async function cancelJobRun({ jobRunId, requestedBy, reason }) {
+  const run = await sqlOne('SELECT job_run_id, status FROM job_runs WHERE job_run_id = ?', [jobRunId]);
   if (!run) return null;
 
   if (['succeeded', 'failed', 'cancelled'].includes(run.status)) {
@@ -2086,18 +1952,17 @@ function cancelJobRun({ jobRunId, requestedBy, reason }) {
   }
 
   const cancelReason = reason || 'Cancelled by user request';
-  db.prepare('UPDATE job_runs SET cancel_requested_at = ?, cancel_requested_by = ?, cancel_reason = ? WHERE job_run_id = ?')
-    .run(nowIso(), requestedBy || null, cancelReason, jobRunId);
+  await sqlRun('UPDATE job_runs SET cancel_requested_at = ?, cancel_requested_by = ?, cancel_reason = ? WHERE job_run_id = ?', [nowIso(), requestedBy || null, cancelReason, jobRunId]);
 
   if (run.status === 'queued') {
-    markRunCancelled(jobRunId, cancelReason);
+    await markRunCancelled(jobRunId, cancelReason);
   }
 
   return { jobRunId, status: run.status === 'queued' ? 'cancelled' : 'cancelling' };
 }
 
-function restartJobRun({ priorJobRunId, restartMode = 'resume-from-failed-step', submittedBy, correlationId }) {
-  const priorRun = db.prepare('SELECT job_run_id, job_name, status, parameters_json FROM job_runs WHERE job_run_id = ?').get(priorJobRunId);
+async function restartJobRun({ priorJobRunId, restartMode = 'resume-from-failed-step', submittedBy, correlationId }) {
+  const priorRun = await sqlOne('SELECT job_run_id, job_name, status, parameters_json FROM job_runs WHERE job_run_id = ?', [priorJobRunId]);
   if (!priorRun) {
     return null;
   }
@@ -2117,7 +1982,7 @@ function restartJobRun({ priorJobRunId, restartMode = 'resume-from-failed-step',
     }
   };
 
-  return submitJob({
+  return await submitJob({
     jobName: priorRun.job_name,
     runMode: 'replay',
     parameters: nextParams,
@@ -2127,8 +1992,8 @@ function restartJobRun({ priorJobRunId, restartMode = 'resume-from-failed-step',
   });
 }
 
-function getJobs() {
-  const rows = db.prepare('SELECT job_name, display_name, category, enabled, default_params_json FROM jobs ORDER BY job_name ASC').all();
+async function getJobs() {
+  const rows = await sqlAll('SELECT job_name, display_name, category, enabled, default_params_json FROM jobs ORDER BY job_name ASC', []);
   return rows.map((row) => ({
     jobName: row.job_name,
     displayName: row.display_name,

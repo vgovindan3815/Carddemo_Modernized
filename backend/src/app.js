@@ -9,14 +9,11 @@ const { randomUUID } = require('crypto');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const { z } = require('zod');
-const { db, migrate, seed } = require('./db');
+const { sqlOne, sqlAll, sqlRun, sqlTx, migrate, seed } = require('./db');
 const { submitJob, getJobs, restartJobRun, cancelJobRun } = require('./batch-runner');
 const { apiError, errorResponse } = require('./errors');
 const { mainMenuOptions, adminMenuOptions, errorCatalog } = require('./constants');
 const { openApiSpec } = require('./openapi');
-
-migrate();
-seed();
 
 const app = express();
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
@@ -245,13 +242,13 @@ app.get('/api/v1/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
-app.post('/api/v1/auth/login', (req, res, next) => {
+app.post('/api/v1/auth/login', async (req, res, next) => {
   try {
     const body = parseOrThrow(loginSchema, req.body);
     if (!body.userId) throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'userId', message: errorCatalog.requiredUserId }]);
     if (!body.password) throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'password', message: errorCatalog.requiredPassword }]);
 
-    const user = db.prepare('SELECT * FROM user_security WHERE user_id = ?').get(body.userId);
+    const user = await sqlOne('SELECT * FROM user_security WHERE user_id = ?', [body.userId]);
     if (!user) {
       throw apiError('UNAUTHORIZED', errorCatalog.wrongPassword, 401, [{ field: 'password', message: 'Password does not match' }]);
     }
@@ -299,475 +296,510 @@ app.get('/api/v1/menu/admin', requireRole('A'), (_req, res) => {
   res.json({ title: 'Admin Menu', options: adminMenuOptions });
 });
 
-app.get('/api/v1/users', requireRole('A'), (req, res) => {
-  const search = req.query.search ? String(req.query.search) : '';
-  const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 10 });
-  const orderBy = resolveSort(req.query.sort, {
-    userId: 'user_id',
-    firstName: 'first_name',
-    lastName: 'last_name',
-    userType: 'user_type'
-  }, 'user_id ASC');
-  const where = search ? 'WHERE user_id LIKE ? OR first_name LIKE ? OR last_name LIKE ?' : '';
-  const params = search ? [`%${search}%`, `%${search}%`, `%${search}%`, pageSize, offset] : [pageSize, offset];
-  const rows = db.prepare(`SELECT user_id, first_name, last_name, user_type FROM user_security ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`).all(...params);
-  const total = db.prepare(`SELECT COUNT(*) as count FROM user_security ${where}`).get(...(search ? [`%${search}%`, `%${search}%`, `%${search}%`] : [])).count;
-  res.json({ items: rows.map(toUserDto), page, pageSize, total });
+app.get('/api/v1/users', requireRole('A'), async (req, res, next) => {
+  try {
+    const search = req.query.search ? String(req.query.search) : '';
+    const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 10 });
+    const orderBy = resolveSort(req.query.sort, {
+      userId: 'user_id',
+      firstName: 'first_name',
+      lastName: 'last_name',
+      userType: 'user_type'
+    }, 'user_id ASC');
+    const where = search ? 'WHERE user_id LIKE ? OR first_name LIKE ? OR last_name LIKE ?' : '';
+    const searchParams = search ? [`%${search}%`, `%${search}%`, `%${search}%`] : [];
+    const rows = await sqlAll(
+      `SELECT user_id, first_name, last_name, user_type FROM user_security ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+      [...searchParams, pageSize, offset]
+    );
+    const totalRow = await sqlOne(
+      `SELECT COUNT(*) as count FROM user_security ${where}`,
+      searchParams
+    );
+    res.json({ items: rows.map(toUserDto), page, pageSize, total: Number(totalRow.count) });
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.get('/api/v1/users/:userId', requireRole('A'), (req, res, next) => {
-  const row = db.prepare('SELECT user_id, first_name, last_name, user_type FROM user_security WHERE user_id = ?').get(req.params.userId);
-  if (!row) return next(apiError('NOT_FOUND', errorCatalog.userNotFound, 404, [{ field: 'userId', message: 'No user exists for supplied userId' }]));
-  res.json(toUserDto(row));
+app.get('/api/v1/users/:userId', requireRole('A'), async (req, res, next) => {
+  try {
+    const row = await sqlOne('SELECT user_id, first_name, last_name, user_type FROM user_security WHERE user_id = ?', [req.params.userId]);
+    if (!row) return next(apiError('NOT_FOUND', errorCatalog.userNotFound, 404, [{ field: 'userId', message: 'No user exists for supplied userId' }]));
+    res.json(toUserDto(row));
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.post('/api/v1/users', requireRole('A'), (req, res, next) => {
+app.post('/api/v1/users', requireRole('A'), async (req, res, next) => {
   try {
     const requiredFieldErrors = collectUserRequiredErrors(req.body);
     if (requiredFieldErrors.length) {
       throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, requiredFieldErrors);
     }
     const body = parseOrThrow(userSchema.extend({ userId: z.string().min(1).max(8) }), req.body);
-    const exists = db.prepare('SELECT user_id FROM user_security WHERE user_id = ?').get(body.userId);
+    const exists = await sqlOne('SELECT user_id FROM user_security WHERE user_id = ?', [body.userId]);
     if (exists) throw apiError('CONFLICT', errorCatalog.duplicateUserId, 409, [{ field: 'userId', message: 'User ID must be unique' }]);
     const hash = bcrypt.hashSync(body.password, 10);
-    db.prepare('INSERT INTO user_security (user_id, first_name, last_name, password_hash, user_type) VALUES (?, ?, ?, ?, ?)')
-      .run(body.userId, body.firstName, body.lastName, hash, body.userType);
+    await sqlRun(
+      'INSERT INTO user_security (user_id, first_name, last_name, password_hash, user_type) VALUES (?, ?, ?, ?, ?)',
+      [body.userId, body.firstName, body.lastName, hash, body.userType]
+    );
     res.status(201).json({ userId: body.userId, firstName: body.firstName, lastName: body.lastName, userType: body.userType, created: true });
   } catch (error) {
     next(error);
   }
 });
 
-app.put('/api/v1/users/:userId', requireRole('A'), (req, res, next) => {
+app.put('/api/v1/users/:userId', requireRole('A'), async (req, res, next) => {
   try {
     const requiredFieldErrors = collectUserRequiredErrors(req.body);
     if (requiredFieldErrors.length) {
       throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, requiredFieldErrors);
     }
     const body = parseOrThrow(userSchema, req.body);
-    const existing = db.prepare('SELECT user_id FROM user_security WHERE user_id = ?').get(req.params.userId);
+    const existing = await sqlOne('SELECT user_id FROM user_security WHERE user_id = ?', [req.params.userId]);
     if (!existing) throw apiError('NOT_FOUND', errorCatalog.userNotFound, 404, [{ field: 'userId', message: 'No user exists for supplied userId' }]);
     const hash = bcrypt.hashSync(body.password, 10);
-    db.prepare('UPDATE user_security SET first_name = ?, last_name = ?, password_hash = ?, user_type = ? WHERE user_id = ?')
-      .run(body.firstName, body.lastName, hash, body.userType, req.params.userId);
+    await sqlRun(
+      'UPDATE user_security SET first_name = ?, last_name = ?, password_hash = ?, user_type = ? WHERE user_id = ?',
+      [body.firstName, body.lastName, hash, body.userType, req.params.userId]
+    );
     res.json({ userId: req.params.userId, firstName: body.firstName, lastName: body.lastName, userType: body.userType, updated: true });
   } catch (error) {
     next(error);
   }
 });
 
-app.delete('/api/v1/users/:userId', requireRole('A'), (req, res, next) => {
-  const row = db.prepare('SELECT user_id FROM user_security WHERE user_id = ?').get(req.params.userId);
-  if (!row) return next(apiError('NOT_FOUND', errorCatalog.userNotFound, 404, [{ field: 'userId', message: 'No user exists for supplied userId' }]));
-  db.prepare('DELETE FROM user_security WHERE user_id = ?').run(req.params.userId);
-  res.status(204).send();
+app.delete('/api/v1/users/:userId', requireRole('A'), async (req, res, next) => {
+  try {
+    const row = await sqlOne('SELECT user_id FROM user_security WHERE user_id = ?', [req.params.userId]);
+    if (!row) return next(apiError('NOT_FOUND', errorCatalog.userNotFound, 404, [{ field: 'userId', message: 'No user exists for supplied userId' }]));
+    await sqlRun('DELETE FROM user_security WHERE user_id = ?', [req.params.userId]);
+    res.status(204).send();
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.get('/api/v1/accounts/:acctId', requireAuth, (req, res, next) => {
-  const acct = db.prepare('SELECT * FROM accounts WHERE acct_id = ?').get(Number(req.params.acctId));
-  if (!acct) return next(apiError('NOT_FOUND', 'Account not found', 404, [{ field: 'acctId', message: 'No account exists for supplied acctId' }]));
-  const xref = db.prepare('SELECT * FROM card_xref WHERE acct_id = ?').get(acct.acct_id);
-  const customer = xref ? db.prepare('SELECT * FROM customers WHERE cust_id = ?').get(xref.cust_id) : null;
-  const cards = db.prepare('SELECT card_num as cardNum, active_status as activeStatus FROM cards WHERE acct_id = ?').all(acct.acct_id);
-  res.json({
-    account: {
-      acctId: acct.acct_id,
-      activeStatus: acct.active_status,
-      currBal: acct.curr_bal,
-      currCycCredit: acct.curr_cyc_credit,
-      currCycDebit: acct.curr_cyc_debit,
-      creditLimit: acct.credit_limit,
-      cashCreditLimit: acct.cash_credit_limit,
-      insertedAt: acct.created_at,
-      openDate: acct.open_date,
-      expirationDate: acct.expiration_date,
-      reissueDate: acct.reissue_date,
-      groupId: acct.group_id
-    },
-    customer: customer ? {
-      custId: customer.cust_id,
-      firstName: customer.first_name,
-      middleName: customer.middle_name,
-      lastName: customer.last_name,
-      ssn: customer.ssn,
-      dob: customer.dob,
-      ficoScore: customer.fico_score,
-      address: {
-        line1: customer.addr_line_1,
-        line2: customer.addr_line_2,
-        line3: customer.addr_line_3,
-        state: customer.state_cd,
-        country: customer.country_cd,
-        zip: customer.zip
+app.get('/api/v1/accounts/:acctId', requireAuth, async (req, res, next) => {
+  try {
+    const acct = await sqlOne('SELECT * FROM accounts WHERE acct_id = ?', [Number(req.params.acctId)]);
+    if (!acct) return next(apiError('NOT_FOUND', 'Account not found', 404, [{ field: 'acctId', message: 'No account exists for supplied acctId' }]));
+    const xref = await sqlOne('SELECT * FROM card_xref WHERE acct_id = ?', [acct.acct_id]);
+    const customer = xref ? await sqlOne('SELECT * FROM customers WHERE cust_id = ?', [xref.cust_id]) : null;
+    const cards = await sqlAll('SELECT card_num as cardNum, active_status as activeStatus FROM cards WHERE acct_id = ?', [acct.acct_id]);
+    res.json({
+      account: {
+        acctId: acct.acct_id,
+        activeStatus: acct.active_status,
+        currBal: acct.curr_bal,
+        currCycCredit: acct.curr_cyc_credit,
+        currCycDebit: acct.curr_cyc_debit,
+        creditLimit: acct.credit_limit,
+        cashCreditLimit: acct.cash_credit_limit,
+        insertedAt: acct.created_at,
+        openDate: acct.open_date,
+        expirationDate: acct.expiration_date,
+        reissueDate: acct.reissue_date,
+        groupId: acct.group_id
       },
-      phone1: customer.phone_1,
-      phone2: customer.phone_2,
-      govtId: customer.govt_id,
-      eftAccountId: customer.eft_account_id,
-      primaryHolderInd: customer.primary_holder_ind
-    } : null,
-    cards
-  });
+      customer: customer ? {
+        custId: customer.cust_id,
+        firstName: customer.first_name,
+        middleName: customer.middle_name,
+        lastName: customer.last_name,
+        ssn: customer.ssn,
+        dob: customer.dob,
+        ficoScore: customer.fico_score,
+        address: {
+          line1: customer.addr_line_1,
+          line2: customer.addr_line_2,
+          line3: customer.addr_line_3,
+          state: customer.state_cd,
+          country: customer.country_cd,
+          zip: customer.zip
+        },
+        phone1: customer.phone_1,
+        phone2: customer.phone_2,
+        govtId: customer.govt_id,
+        eftAccountId: customer.eft_account_id,
+        primaryHolderInd: customer.primary_holder_ind
+      } : null,
+      cards
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.get('/api/v1/accounts', requireAuth, (req, res) => {
-  const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 20 });
-  const orderBy = resolveSort(req.query.sort, {
-    acctId: 'a.acct_id',
-    currBal: 'a.curr_bal',
-    activeStatus: 'a.active_status'
-  }, 'a.acct_id ASC');
-  const search = req.query.search ? String(req.query.search) : '';
-  const where = search ? 'WHERE CAST(a.acct_id as TEXT) LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ?' : '';
-  const baseQuery = `
-    SELECT
-      a.acct_id as acctId,
-      a.active_status as activeStatus,
-      a.curr_bal as currBal,
-      a.credit_limit as creditLimit,
-      a.expiration_date as expirationDate,
-      c.cust_id as custId,
-      c.first_name as firstName,
-      c.last_name as lastName
-    FROM accounts a
-    LEFT JOIN card_xref x ON x.acct_id = a.acct_id
-    LEFT JOIN customers c ON c.cust_id = x.cust_id
-    ${where}
-    GROUP BY a.acct_id
-    ORDER BY ${orderBy}
-    LIMIT ? OFFSET ?
-  `;
-  const countQuery = `
-    SELECT COUNT(DISTINCT a.acct_id) as count
-    FROM accounts a
-    LEFT JOIN card_xref x ON x.acct_id = a.acct_id
-    LEFT JOIN customers c ON c.cust_id = x.cust_id
-    ${where}
-  `;
-  const params = search ? [`%${search}%`, `%${search}%`, `%${search}%`, pageSize, offset] : [pageSize, offset];
-  const rows = db.prepare(baseQuery).all(...params);
-  const totalParams = search ? [`%${search}%`, `%${search}%`, `%${search}%`] : [];
-  const total = db.prepare(countQuery).get(...totalParams).count;
-  res.json({ items: rows, page, pageSize, total });
+app.get('/api/v1/accounts', requireAuth, async (req, res, next) => {
+  try {
+    const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 20 });
+    const orderBy = resolveSort(req.query.sort, {
+      acctId: 'a.acct_id',
+      currBal: 'a.curr_bal',
+      activeStatus: 'a.active_status'
+    }, 'a.acct_id ASC');
+    const search = req.query.search ? String(req.query.search) : '';
+    const where = search ? 'WHERE CAST(a.acct_id AS TEXT) LIKE ? OR c.first_name LIKE ? OR c.last_name LIKE ?' : '';
+    const searchParams = search ? [`%${search}%`, `%${search}%`, `%${search}%`] : [];
+    const baseQuery = `
+      SELECT
+        a.acct_id as "acctId",
+        a.active_status as "activeStatus",
+        a.curr_bal as "currBal",
+        a.credit_limit as "creditLimit",
+        a.expiration_date as "expirationDate",
+        c.cust_id as "custId",
+        c.first_name as "firstName",
+        c.last_name as "lastName"
+      FROM accounts a
+      LEFT JOIN card_xref x ON x.acct_id = a.acct_id
+      LEFT JOIN customers c ON c.cust_id = x.cust_id
+      ${where}
+      GROUP BY a.acct_id, a.active_status, a.curr_bal, a.credit_limit, a.expiration_date, c.cust_id, c.first_name, c.last_name
+      ORDER BY ${orderBy}
+      LIMIT ? OFFSET ?
+    `;
+    const countQuery = `
+      SELECT COUNT(DISTINCT a.acct_id) as count
+      FROM accounts a
+      LEFT JOIN card_xref x ON x.acct_id = a.acct_id
+      LEFT JOIN customers c ON c.cust_id = x.cust_id
+      ${where}
+    `;
+    const rows = await sqlAll(baseQuery, [...searchParams, pageSize, offset]);
+    const totalRow = await sqlOne(countQuery, searchParams);
+    res.json({ items: rows, page, pageSize, total: Number(totalRow.count) });
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.put('/api/v1/accounts/:acctId', requireAuth, (req, res, next) => {
+app.put('/api/v1/accounts/:acctId', requireAuth, async (req, res, next) => {
   try {
     const body = parseOrThrow(accountUpdateSchema, req.body);
     if (body.confirm !== 'Y') throw apiError('VALIDATION_ERROR', errorCatalog.invalidConfirm, 400, [{ field: 'confirm', message: errorCatalog.invalidConfirm }]);
     const acctId = Number(req.params.acctId);
-    const existingAcct = db.prepare('SELECT acct_id FROM accounts WHERE acct_id = ?').get(acctId);
+    const existingAcct = await sqlOne('SELECT acct_id FROM accounts WHERE acct_id = ?', [acctId]);
     if (!existingAcct) throw apiError('NOT_FOUND', 'Account not found', 404, [{ field: 'acctId', message: 'No account exists for supplied acctId' }]);
-    const tx = db.transaction(() => {
-      const accountResult = db.prepare(`UPDATE accounts SET active_status=?, credit_limit=?, cash_credit_limit=?, open_date=?, expiration_date=?, reissue_date=?, curr_bal=?, curr_cyc_credit=?, curr_cyc_debit=?, group_id=? WHERE acct_id=?`)
-        .run(body.account.activeStatus, body.account.creditLimit, body.account.cashCreditLimit, body.account.openDate, body.account.expirationDate, body.account.reissueDate, body.account.currBal, body.account.currCycCredit, body.account.currCycDebit, body.account.groupId || null, acctId);
-      if (!accountResult.changes) throw apiError('NOT_FOUND', 'Account not found', 404, [{ field: 'acctId', message: 'No account exists for supplied acctId' }]);
-      const customerResult = db.prepare(`UPDATE customers SET first_name=?, middle_name=?, last_name=?, ssn=?, dob=?, fico_score=?, addr_line_1=?, addr_line_2=?, addr_line_3=?, state_cd=?, country_cd=?, zip=?, phone_1=?, phone_2=?, govt_id=?, eft_account_id=?, primary_holder_ind=? WHERE cust_id=?`)
-        .run(body.customer.firstName, body.customer.middleName || null, body.customer.lastName, body.customer.ssn, body.customer.dob, body.customer.ficoScore, body.customer.address.line1, body.customer.address.line2 || null, body.customer.address.line3 || null, body.customer.address.state, body.customer.address.country, body.customer.address.zip, body.customer.phone1 || null, body.customer.phone2 || null, body.customer.govtId || null, body.customer.eftAccountId || null, body.customer.primaryHolderInd || null, body.customer.custId);
-      if (!customerResult.changes) throw apiError('NOT_FOUND', 'Customer not found', 404, [{ field: 'customer.custId', message: 'No customer exists for supplied custId' }]);
+
+    await sqlTx(async ({ txRun }) => {
+      const updatedAcct = await txRun(
+        `UPDATE accounts SET active_status=?, credit_limit=?, cash_credit_limit=?, open_date=?, expiration_date=?, reissue_date=?, curr_bal=?, curr_cyc_credit=?, curr_cyc_debit=?, group_id=? WHERE acct_id=? RETURNING acct_id`,
+        [body.account.activeStatus, body.account.creditLimit, body.account.cashCreditLimit, body.account.openDate, body.account.expirationDate, body.account.reissueDate, body.account.currBal, body.account.currCycCredit, body.account.currCycDebit, body.account.groupId || null, acctId]
+      );
+      if (!updatedAcct[0]) throw apiError('NOT_FOUND', 'Account not found', 404, [{ field: 'acctId', message: 'No account exists for supplied acctId' }]);
+
+      const updatedCust = await txRun(
+        `UPDATE customers SET first_name=?, middle_name=?, last_name=?, ssn=?, dob=?, fico_score=?, addr_line_1=?, addr_line_2=?, addr_line_3=?, state_cd=?, country_cd=?, zip=?, phone_1=?, phone_2=?, govt_id=?, eft_account_id=?, primary_holder_ind=? WHERE cust_id=? RETURNING cust_id`,
+        [body.customer.firstName, body.customer.middleName || null, body.customer.lastName, body.customer.ssn, body.customer.dob, body.customer.ficoScore, body.customer.address.line1, body.customer.address.line2 || null, body.customer.address.line3 || null, body.customer.address.state, body.customer.address.country, body.customer.address.zip, body.customer.phone1 || null, body.customer.phone2 || null, body.customer.govtId || null, body.customer.eftAccountId || null, body.customer.primaryHolderInd || null, body.customer.custId]
+      );
+      if (!updatedCust[0]) throw apiError('NOT_FOUND', 'Customer not found', 404, [{ field: 'customer.custId', message: 'No customer exists for supplied custId' }]);
     });
-    tx();
+
     res.json({ acctId, updated: true, message: 'Account and customer details updated' });
   } catch (error) {
     next(error);
   }
 });
 
-app.get('/api/v1/cards', requireAuth, (req, res) => {
-  const acctId = req.query.acctId ? Number(req.query.acctId) : null;
-  const cardNum = req.query.cardNum ? String(req.query.cardNum) : null;
-  const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 10 });
-  const orderBy = resolveSort(req.query.sort, {
-    cardNum: 'card_num',
-    acctId: 'acct_id',
-    expirationDate: 'expiration_date'
-  }, 'card_num ASC');
-  const whereParts = [];
-  const whereParams = [];
-  if (Number.isFinite(acctId)) {
-    whereParts.push('acct_id = ?');
-    whereParams.push(acctId);
+app.get('/api/v1/cards', requireAuth, async (req, res, next) => {
+  try {
+    const acctId = req.query.acctId ? Number(req.query.acctId) : null;
+    const cardNum = req.query.cardNum ? String(req.query.cardNum) : null;
+    const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 10 });
+    const orderBy = resolveSort(req.query.sort, {
+      cardNum: 'card_num',
+      acctId: 'acct_id',
+      expirationDate: 'expiration_date'
+    }, 'card_num ASC');
+    const whereParts = [];
+    const whereParams = [];
+    if (Number.isFinite(acctId)) {
+      whereParts.push('acct_id = ?');
+      whereParams.push(acctId);
+    }
+    if (cardNum) {
+      whereParts.push('card_num = ?');
+      whereParams.push(cardNum);
+    }
+    const where = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+    const rows = await sqlAll(
+      `SELECT card_num as "cardNum", acct_id as "acctId", embossed_name as "embossedName", expiration_date as "expirationDate", cvv_cd as "secretCode", active_status as "activeStatus" FROM cards ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+      [...whereParams, pageSize, offset]
+    );
+    const totalRow = await sqlOne(`SELECT COUNT(*) as count FROM cards ${where}`, whereParams);
+    res.json({ items: rows, page, pageSize, total: Number(totalRow.count) });
+  } catch (error) {
+    next(error);
   }
-  if (cardNum) {
-    whereParts.push('card_num = ?');
-    whereParams.push(cardNum);
-  }
-  const where = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
-  const rows = db.prepare(`SELECT card_num as cardNum, acct_id as acctId, embossed_name as embossedName, expiration_date as expirationDate, cvv_cd as secretCode, active_status as activeStatus FROM cards ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`)
-    .all(...whereParams, pageSize, offset);
-  const total = db.prepare(`SELECT COUNT(*) as count FROM cards ${where}`).get(...whereParams).count;
-  res.json({ items: rows, page, pageSize, total });
 });
 
-app.get('/api/v1/cards/:cardNum', requireAuth, (req, res, next) => {
-  const card = db.prepare('SELECT * FROM cards WHERE card_num = ?').get(req.params.cardNum);
-  if (!card) return next(apiError('NOT_FOUND', 'Card not found', 404, [{ field: 'cardNum', message: 'No card exists for supplied card number' }]));
-  const acct = db.prepare('SELECT acct_id, curr_bal FROM accounts WHERE acct_id = ?').get(card.acct_id);
-  const xref = db.prepare('SELECT cust_id FROM card_xref WHERE card_num = ?').get(card.card_num);
-  const customer = xref ? db.prepare('SELECT cust_id, first_name, last_name FROM customers WHERE cust_id = ?').get(xref.cust_id) : null;
-  res.json({
-    card: { cardNum: card.card_num, embossedName: card.embossed_name, activeStatus: card.active_status, expirationDate: card.expiration_date, secretCode: card.cvv_cd },
-    account: acct ? { acctId: acct.acct_id, currBal: acct.curr_bal } : null,
-    customer: customer ? { custId: customer.cust_id, firstName: customer.first_name, lastName: customer.last_name } : null
-  });
+app.get('/api/v1/cards/:cardNum', requireAuth, async (req, res, next) => {
+  try {
+    const card = await sqlOne('SELECT * FROM cards WHERE card_num = ?', [req.params.cardNum]);
+    if (!card) return next(apiError('NOT_FOUND', 'Card not found', 404, [{ field: 'cardNum', message: 'No card exists for supplied card number' }]));
+    const acct = await sqlOne('SELECT acct_id, curr_bal FROM accounts WHERE acct_id = ?', [card.acct_id]);
+    const xref = await sqlOne('SELECT cust_id FROM card_xref WHERE card_num = ?', [card.card_num]);
+    const customer = xref ? await sqlOne('SELECT cust_id, first_name, last_name FROM customers WHERE cust_id = ?', [xref.cust_id]) : null;
+    res.json({
+      card: { cardNum: card.card_num, embossedName: card.embossed_name, activeStatus: card.active_status, expirationDate: card.expiration_date, secretCode: card.cvv_cd },
+      account: acct ? { acctId: acct.acct_id, currBal: acct.curr_bal } : null,
+      customer: customer ? { custId: customer.cust_id, firstName: customer.first_name, lastName: customer.last_name } : null
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.put('/api/v1/cards/:cardNum', requireAuth, (req, res, next) => {
+app.put('/api/v1/cards/:cardNum', requireAuth, async (req, res, next) => {
   try {
     const body = parseOrThrow(cardUpdateSchema, req.body);
     if (body.confirm !== 'Y') throw apiError('VALIDATION_ERROR', errorCatalog.invalidConfirm, 400, [{ field: 'confirm', message: errorCatalog.invalidConfirm }]);
-    const result = db.prepare('UPDATE cards SET embossed_name = ?, active_status = ?, expiration_date = ? WHERE card_num = ?')
-      .run(body.embossedName, body.activeStatus, body.expirationDate, req.params.cardNum);
-    if (!result.changes) throw apiError('NOT_FOUND', 'Card not found', 404, [{ field: 'cardNum', message: 'No card exists for supplied card number' }]);
+    const updated = await sqlRun(
+      'UPDATE cards SET embossed_name = ?, active_status = ?, expiration_date = ? WHERE card_num = ? RETURNING card_num',
+      [body.embossedName, body.activeStatus, body.expirationDate, req.params.cardNum]
+    );
+    if (!updated[0]) throw apiError('NOT_FOUND', 'Card not found', 404, [{ field: 'cardNum', message: 'No card exists for supplied card number' }]);
     res.json({ cardNum: req.params.cardNum, updated: true, message: 'Card updated' });
   } catch (error) {
     next(error);
   }
 });
 
-app.get('/api/v1/transactions', requireAuth, (req, res) => {
-  const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 10 });
-  const orderBy = resolveSort(req.query.sort, {
-    tranId: 'tran_id',
-    procTs: 'proc_ts',
-    amount: 'amount'
-  }, 'proc_ts DESC');
-  const cardNum = req.query.cardNum ? String(req.query.cardNum) : null;
-  const acctId = req.query.acctId ? Number(req.query.acctId) : null;
-  const whereParts = [];
-  const whereParams = [];
-  if (cardNum) {
-    whereParts.push('card_num = ?');
-    whereParams.push(cardNum);
-  }
-  if (Number.isFinite(acctId)) {
-    whereParts.push('card_num IN (SELECT card_num FROM cards WHERE acct_id = ?)');
-    whereParams.push(acctId);
-  }
-  const where = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
-  const rows = db.prepare(`SELECT tran_id as tranId, tran_type_cd as tranTypeCd, tran_cat_cd as tranCatCd, amount, merchant_name as merchantName, card_num as cardNum, orig_ts as origTs, proc_ts as procTs FROM transactions ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`)
-    .all(...whereParams, pageSize, offset);
-  const total = db.prepare(`SELECT COUNT(*) as count FROM transactions ${where}`).get(...whereParams).count;
-  res.json({ items: rows, page, pageSize, total });
-});
-
-app.get('/api/v1/transactions/:tranId', requireAuth, (req, res, next) => {
-  const row = db.prepare('SELECT * FROM transactions WHERE tran_id = ?').get(req.params.tranId);
-  if (!row) return next(apiError('NOT_FOUND', 'Transaction not found', 404, [{ field: 'tranId', message: 'No transaction exists for supplied tranId' }]));
-  res.json({
-    tranId: row.tran_id,
-    tranTypeCd: row.tran_type_cd,
-    tranCatCd: row.tran_cat_cd,
-    source: row.source,
-    description: row.description,
-    amount: row.amount,
-    merchantId: row.merchant_id,
-    merchantName: row.merchant_name,
-    merchantCity: row.merchant_city,
-    merchantZip: row.merchant_zip,
-    cardNum: row.card_num,
-    origTs: row.orig_ts,
-    procTs: row.proc_ts
-  });
-});
-
-app.post('/api/v1/transactions', requireAuth, (req, res, next) => {
+app.get('/api/v1/transactions', requireAuth, async (req, res, next) => {
   try {
-    if (isBlank(req.body?.tranTypeCd)) {
-      throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'tranTypeCd', message: errorCatalog.requiredTranType }]);
+    const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 10 });
+    const orderBy = resolveSort(req.query.sort, {
+      tranId: 'tran_id',
+      procTs: 'proc_ts',
+      amount: 'amount'
+    }, 'proc_ts DESC');
+    const cardNum = req.query.cardNum ? String(req.query.cardNum) : null;
+    const acctId = req.query.acctId ? Number(req.query.acctId) : null;
+    const whereParts = [];
+    const whereParams = [];
+    if (cardNum) {
+      whereParts.push('card_num = ?');
+      whereParams.push(cardNum);
     }
-    if (isBlank(req.body?.tranCatCd)) {
-      throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'tranCatCd', message: errorCatalog.requiredTranCategory }]);
+    if (Number.isFinite(acctId)) {
+      whereParts.push('card_num IN (SELECT card_num FROM cards WHERE acct_id = ?)');
+      whereParams.push(acctId);
     }
-    if (isBlank(req.body?.amount)) {
-      throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'amount', message: errorCatalog.requiredAmount }]);
-    }
-    if (isBlank(req.body?.description)) {
-      throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'description', message: errorCatalog.requiredDescription }]);
-    }
+    const where = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+    const rows = await sqlAll(
+      `SELECT tran_id as "tranId", tran_type_cd as "tranTypeCd", tran_cat_cd as "tranCatCd", amount, merchant_name as "merchantName", card_num as "cardNum", orig_ts as "origTs", proc_ts as "procTs" FROM transactions ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+      [...whereParams, pageSize, offset]
+    );
+    const totalRow = await sqlOne(`SELECT COUNT(*) as count FROM transactions ${where}`, whereParams);
+    res.json({ items: rows, page, pageSize, total: Number(totalRow.count) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/v1/transactions/:tranId', requireAuth, async (req, res, next) => {
+  try {
+    const row = await sqlOne('SELECT * FROM transactions WHERE tran_id = ?', [req.params.tranId]);
+    if (!row) return next(apiError('NOT_FOUND', 'Transaction not found', 404, [{ field: 'tranId', message: 'No transaction exists for supplied tranId' }]));
+    res.json({
+      tranId: row.tran_id,
+      tranTypeCd: row.tran_type_cd,
+      tranCatCd: row.tran_cat_cd,
+      source: row.source,
+      description: row.description,
+      amount: row.amount,
+      merchantId: row.merchant_id,
+      merchantName: row.merchant_name,
+      merchantCity: row.merchant_city,
+      merchantZip: row.merchant_zip,
+      cardNum: row.card_num,
+      origTs: row.orig_ts,
+      procTs: row.proc_ts
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/v1/transactions', requireAuth, async (req, res, next) => {
+  try {
+    if (isBlank(req.body?.tranTypeCd)) throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'tranTypeCd', message: errorCatalog.requiredTranType }]);
+    if (isBlank(req.body?.tranCatCd)) throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'tranCatCd', message: errorCatalog.requiredTranCategory }]);
+    if (isBlank(req.body?.amount)) throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'amount', message: errorCatalog.requiredAmount }]);
+    if (isBlank(req.body?.description)) throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'description', message: errorCatalog.requiredDescription }]);
+
     const body = parseOrThrow(transactionCreateSchema, req.body);
     if (body.confirm !== 'Y') throw apiError('VALIDATION_ERROR', errorCatalog.invalidConfirm, 400, [{ field: 'confirm', message: errorCatalog.invalidConfirm }]);
-    const card = db.prepare('SELECT card_num, acct_id FROM cards WHERE card_num = ?').get(body.cardNum);
+
+    const card = await sqlOne('SELECT card_num, acct_id FROM cards WHERE card_num = ?', [body.cardNum]);
     if (!card) throw apiError('NOT_FOUND', 'Card not found', 404, [{ field: 'cardNum', message: 'No card exists for supplied card number' }]);
     if (Number(card.acct_id) !== Number(body.acctId)) {
       throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'acctId', message: 'Card/account relation is invalid' }]);
     }
+
     const origTs = parseStrictIsoDate(body.origDate);
     const procTs = parseStrictIsoDate(body.procDate);
     if (!origTs || !procTs) {
       throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'origDate', message: 'Start Date - Not a valid date...' }, { field: 'procDate', message: 'End Date - Not a valid date...' }]);
     }
+
     const tranId = `TXN${Date.now()}`;
-    db.prepare('INSERT INTO transactions (tran_id, tran_type_cd, tran_cat_cd, source, description, amount, merchant_id, merchant_name, merchant_city, merchant_zip, card_num, orig_ts, proc_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(tranId, body.tranTypeCd, body.tranCatCd, body.source, body.description, body.amount, body.merchantId, body.merchantName, body.merchantCity, body.merchantZip, body.cardNum, `${body.origDate}T00:00:00Z`, `${body.procDate}T00:00:00Z`);
+    await sqlRun(
+      'INSERT INTO transactions (tran_id, tran_type_cd, tran_cat_cd, source, description, amount, merchant_id, merchant_name, merchant_city, merchant_zip, card_num, orig_ts, proc_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [tranId, body.tranTypeCd, body.tranCatCd, body.source, body.description, body.amount, body.merchantId, body.merchantName, body.merchantCity, body.merchantZip, body.cardNum, `${body.origDate}T00:00:00Z`, `${body.procDate}T00:00:00Z`]
+    );
     res.status(201).json({ tranId, created: true, message: 'Transaction added' });
   } catch (error) {
     next(error);
   }
 });
 
-app.get('/api/v1/authorizations', requireAuth, (req, res) => {
-  const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 10 });
-  const orderBy = resolveSort(req.query.sort, {
-    authId: 'auth_id',
-    authDate: 'auth_date',
-    amount: 'transaction_amt'
-  }, 'auth_date DESC, auth_time DESC');
-  const acctId = req.query.acctId ? Number(req.query.acctId) : null;
-  const cardNum = req.query.cardNum ? String(req.query.cardNum) : null;
-  const matchStatus = req.query.status ? String(req.query.status) : null;
-  const whereParts = [];
-  const whereParams = [];
-  if (Number.isFinite(acctId)) {
-    whereParts.push('acct_id = ?');
-    whereParams.push(acctId);
+app.get('/api/v1/authorizations', requireAuth, async (req, res, next) => {
+  try {
+    const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 10 });
+    const orderBy = resolveSort(req.query.sort, {
+      authId: 'auth_id',
+      authDate: 'auth_date',
+      amount: 'transaction_amt'
+    }, 'auth_date DESC, auth_time DESC');
+    const acctId = req.query.acctId ? Number(req.query.acctId) : null;
+    const cardNum = req.query.cardNum ? String(req.query.cardNum) : null;
+    const matchStatus = req.query.status ? String(req.query.status) : null;
+    const whereParts = [];
+    const whereParams = [];
+    if (Number.isFinite(acctId)) { whereParts.push('acct_id = ?'); whereParams.push(acctId); }
+    if (cardNum) { whereParts.push('card_num = ?'); whereParams.push(cardNum); }
+    if (matchStatus) { whereParts.push('match_status = ?'); whereParams.push(matchStatus); }
+    const where = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+    const rows = await sqlAll(
+      `SELECT auth_id as "authId", acct_id as "acctId", auth_date as "authDate", auth_time as "authTime", card_num as "cardNum", auth_type as "authType", auth_resp_code as "authRespCode", transaction_amt as "transactionAmt", approved_amt as "approvedAmt", merchant_name as "merchantName", merchant_city as "merchantCity", match_status as "matchStatus", auth_fraud as "authFraud" FROM authorization_details ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+      [...whereParams, pageSize, offset]
+    );
+    const totalRow = await sqlOne(`SELECT COUNT(*) as count FROM authorization_details ${where}`, whereParams);
+    res.json({ items: rows, page, pageSize, total: Number(totalRow.count) });
+  } catch (error) {
+    next(error);
   }
-  if (cardNum) {
-    whereParts.push('card_num = ?');
-    whereParams.push(cardNum);
-  }
-  if (matchStatus) {
-    whereParts.push('match_status = ?');
-    whereParams.push(matchStatus);
-  }
-  const where = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
-  const rows = db.prepare(`SELECT auth_id as authId, acct_id as acctId, auth_date as authDate, auth_time as authTime, card_num as cardNum, auth_type as authType, auth_resp_code as authRespCode, transaction_amt as transactionAmt, approved_amt as approvedAmt, merchant_name as merchantName, merchant_city as merchantCity, match_status as matchStatus, auth_fraud as authFraud FROM authorization_details ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`)
-    .all(...whereParams, pageSize, offset);
-  const total = db.prepare(`SELECT COUNT(*) as count FROM authorization_details ${where}`).get(...whereParams).count;
-  res.json({ items: rows, page, pageSize, total });
 });
 
-app.get('/api/v1/authorizations/:authId', requireAuth, (req, res, next) => {
-  const row = db.prepare('SELECT * FROM authorization_details WHERE auth_id = ?').get(req.params.authId);
-  if (!row) return next(apiError('NOT_FOUND', 'Authorization not found', 404, [{ field: 'authId', message: 'No authorization exists for supplied authId' }]));
-  res.json({
-    authId: row.auth_id,
-    acctId: row.acct_id,
-    authDate: row.auth_date,
-    authTime: row.auth_time,
-    authOrigDate: row.auth_orig_date,
-    authOrigTime: row.auth_orig_time,
-    cardNum: row.card_num,
-    authType: row.auth_type,
-    cardExpiryDate: row.card_expiry_date,
-    messageType: row.message_type,
-    messageSource: row.message_source,
-    authIdCode: row.auth_id_code,
-    authRespCode: row.auth_resp_code,
-    authRespReason: row.auth_resp_reason,
-    processingCode: row.processing_code,
-    transactionAmt: row.transaction_amt,
-    approvedAmt: row.approved_amt,
-    merchantCategoryCode: row.merchant_category_code,
-    acqrCountryCode: row.acqr_country_code,
-    posEntryMode: row.pos_entry_mode,
-    merchantId: row.merchant_id,
-    merchantName: row.merchant_name,
-    merchantCity: row.merchant_city,
-    merchantState: row.merchant_state,
-    merchantZip: row.merchant_zip,
-    transactionId: row.transaction_id,
-    matchStatus: row.match_status,
-    authFraud: row.auth_fraud,
-    fraudRptDate: row.fraud_rpt_date,
-    createdAt: row.created_at
-  });
+app.get('/api/v1/authorizations/:authId', requireAuth, async (req, res, next) => {
+  try {
+    const row = await sqlOne('SELECT * FROM authorization_details WHERE auth_id = ?', [req.params.authId]);
+    if (!row) return next(apiError('NOT_FOUND', 'Authorization not found', 404, [{ field: 'authId', message: 'No authorization exists for supplied authId' }]));
+    res.json({
+      authId: row.auth_id, acctId: row.acct_id, authDate: row.auth_date, authTime: row.auth_time,
+      authOrigDate: row.auth_orig_date, authOrigTime: row.auth_orig_time, cardNum: row.card_num,
+      authType: row.auth_type, cardExpiryDate: row.card_expiry_date, messageType: row.message_type,
+      messageSource: row.message_source, authIdCode: row.auth_id_code, authRespCode: row.auth_resp_code,
+      authRespReason: row.auth_resp_reason, processingCode: row.processing_code,
+      transactionAmt: row.transaction_amt, approvedAmt: row.approved_amt,
+      merchantCategoryCode: row.merchant_category_code, acqrCountryCode: row.acqr_country_code,
+      posEntryMode: row.pos_entry_mode, merchantId: row.merchant_id, merchantName: row.merchant_name,
+      merchantCity: row.merchant_city, merchantState: row.merchant_state, merchantZip: row.merchant_zip,
+      transactionId: row.transaction_id, matchStatus: row.match_status, authFraud: row.auth_fraud,
+      fraudRptDate: row.fraud_rpt_date, createdAt: row.created_at
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.put('/api/v1/authorizations/:authId/fraud', requireAuth, (req, res, next) => {
+app.put('/api/v1/authorizations/:authId/fraud', requireAuth, async (req, res, next) => {
   try {
     const { authId } = req.params;
-    const row = db.prepare('SELECT * FROM authorization_details WHERE auth_id = ?').get(authId);
+    const row = await sqlOne('SELECT * FROM authorization_details WHERE auth_id = ?', [authId]);
     if (!row) return next(apiError('NOT_FOUND', 'Authorization not found', 404, [{ field: 'authId', message: 'No authorization exists for supplied authId' }]));
     const fraudStatus = req.body.fraudStatus || 'F';
     const fraudRptDate = new Date().toISOString().split('T')[0].replace(/-/g, '');
-    db.prepare('UPDATE authorization_details SET auth_fraud = ?, fraud_rpt_date = ? WHERE auth_id = ?')
-      .run(fraudStatus, fraudRptDate, authId);
+    await sqlRun(
+      'UPDATE authorization_details SET auth_fraud = ?, fraud_rpt_date = ? WHERE auth_id = ?',
+      [fraudStatus, fraudRptDate, authId]
+    );
     res.json({ authId, updated: true, message: 'Authorization marked as fraud' });
   } catch (error) {
     next(error);
   }
 });
 
-app.post('/api/v1/billing/payments', requireAuth, (req, res, next) => {
+app.post('/api/v1/billing/payments', requireAuth, async (req, res, next) => {
   try {
-    if (isBlank(req.body?.acctId)) {
-      throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'acctId', message: errorCatalog.requiredAcctId }]);
-    }
-    if (isBlank(req.body?.amount)) {
-      throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'amount', message: errorCatalog.requiredAmount }]);
-    }
+    if (isBlank(req.body?.acctId)) throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'acctId', message: errorCatalog.requiredAcctId }]);
+    if (isBlank(req.body?.amount)) throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'amount', message: errorCatalog.requiredAmount }]);
     if (req.body?.card) {
-      if (isBlank(req.body?.card?.cardNum)) {
-        throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'card.cardNum', message: errorCatalog.requiredCardNumber }]);
-      }
-      if (isBlank(req.body?.card?.expirationDate)) {
-        throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'card.expirationDate', message: errorCatalog.requiredCardExpiry }]);
-      }
-      if (isBlank(req.body?.card?.secretCode)) {
-        throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'card.secretCode', message: errorCatalog.requiredCardCvv }]);
-      }
+      if (isBlank(req.body?.card?.cardNum)) throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'card.cardNum', message: errorCatalog.requiredCardNumber }]);
+      if (isBlank(req.body?.card?.expirationDate)) throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'card.expirationDate', message: errorCatalog.requiredCardExpiry }]);
+      if (isBlank(req.body?.card?.secretCode)) throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'card.secretCode', message: errorCatalog.requiredCardCvv }]);
     }
+
     const body = parseOrThrow(billingSchema, req.body);
     if (body.confirm !== 'Y') throw apiError('VALIDATION_ERROR', errorCatalog.confirmPayment, 400, [{ field: 'confirm', message: 'confirm must be Y to post payment' }]);
-    const account = db.prepare('SELECT acct_id FROM accounts WHERE acct_id = ?').get(body.acctId);
+
+    const account = await sqlOne('SELECT acct_id FROM accounts WHERE acct_id = ?', [body.acctId]);
     if (!account) throw apiError('NOT_FOUND', 'Account not found', 404, [{ field: 'acctId', message: 'No account exists for supplied acctId' }]);
 
     let paymentCardNum = null;
     if (body.card) {
       const expiry = parseStrictIsoDate(body.card.expirationDate);
-      if (!expiry) {
-        throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'card.expirationDate', message: 'Expiry Date - Not a valid date...' }]);
-      }
-      const existingCardByNumber = db.prepare('SELECT card_num, acct_id FROM cards WHERE card_num = ?').get(body.card.cardNum);
+      if (!expiry) throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'card.expirationDate', message: 'Expiry Date - Not a valid date...' }]);
+
+      const existingCardByNumber = await sqlOne('SELECT card_num, acct_id FROM cards WHERE card_num = ?', [body.card.cardNum]);
       if (existingCardByNumber && Number(existingCardByNumber.acct_id) !== Number(body.acctId)) {
         throw apiError('CONFLICT', 'Card belongs to a different account', 409, [{ field: 'card.cardNum', message: 'Card/account relation is invalid' }]);
       }
 
-      const xref = db.prepare('SELECT cust_id FROM card_xref WHERE acct_id = ? LIMIT 1').get(body.acctId);
-      const cust = xref ? db.prepare('SELECT first_name, last_name FROM customers WHERE cust_id = ?').get(xref.cust_id) : null;
+      const xref = await sqlOne('SELECT cust_id FROM card_xref WHERE acct_id = ? LIMIT 1', [body.acctId]);
+      const cust = xref ? await sqlOne('SELECT first_name, last_name FROM customers WHERE cust_id = ?', [xref.cust_id]) : null;
       const embossedName = cust ? `${cust.first_name} ${cust.last_name}`.trim() : 'ACCOUNT HOLDER';
 
       if (existingCardByNumber) {
-        db.prepare('UPDATE cards SET cvv_cd = ?, expiration_date = ?, active_status = ? WHERE card_num = ?')
-          .run(body.card.secretCode, body.card.expirationDate, 'Y', body.card.cardNum);
+        await sqlRun(
+          'UPDATE cards SET cvv_cd = ?, expiration_date = ?, active_status = ? WHERE card_num = ?',
+          [body.card.secretCode, body.card.expirationDate, 'Y', body.card.cardNum]
+        );
       } else {
-        db.prepare('INSERT INTO cards (card_num, acct_id, cvv_cd, embossed_name, expiration_date, active_status) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(body.card.cardNum, body.acctId, body.card.secretCode, embossedName, body.card.expirationDate, 'Y');
+        await sqlRun(
+          'INSERT INTO cards (card_num, acct_id, cvv_cd, embossed_name, expiration_date, active_status) VALUES (?, ?, ?, ?, ?, ?)',
+          [body.card.cardNum, body.acctId, body.card.secretCode, embossedName, body.card.expirationDate, 'Y']
+        );
         if (xref) {
-          db.prepare('INSERT INTO card_xref (card_num, cust_id, acct_id) VALUES (?, ?, ?)')
-            .run(body.card.cardNum, xref.cust_id, body.acctId);
+          await sqlRun(
+            'INSERT INTO card_xref (card_num, cust_id, acct_id) VALUES (?, ?, ?)',
+            [body.card.cardNum, xref.cust_id, body.acctId]
+          );
         }
       }
-
       paymentCardNum = body.card.cardNum;
     }
 
     if (!paymentCardNum) {
-      const existingCardForAcct = db.prepare('SELECT card_num FROM cards WHERE acct_id = ? ORDER BY card_num LIMIT 1').get(body.acctId);
-      if (!existingCardForAcct) {
-        throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'card.cardNum', message: errorCatalog.requiredCardNumber }]);
-      }
+      const existingCardForAcct = await sqlOne('SELECT card_num FROM cards WHERE acct_id = ? ORDER BY card_num LIMIT 1', [body.acctId]);
+      if (!existingCardForAcct) throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'card.cardNum', message: errorCatalog.requiredCardNumber }]);
       paymentCardNum = existingCardForAcct.card_num;
     }
 
     const tranId = `TXN${Date.now()}`;
-    const tx = db.transaction(() => {
-      db.prepare('UPDATE accounts SET curr_bal = curr_bal - ? WHERE acct_id = ?').run(body.amount, body.acctId);
+    await sqlTx(async ({ txRun }) => {
+      await txRun('UPDATE accounts SET curr_bal = curr_bal - ? WHERE acct_id = ?', [body.amount, body.acctId]);
       const now = new Date().toISOString();
-      db.prepare('INSERT INTO transactions (tran_id, tran_type_cd, tran_cat_cd, source, description, amount, merchant_id, merchant_name, merchant_city, merchant_zip, card_num, orig_ts, proc_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(tranId, 'PM', 2001, 'BILLPAY', 'Bill payment', body.amount, 100234567, 'UTILITY PAYMENT', 'AUSTIN', '73301', paymentCardNum, now, now);
+      await txRun(
+        'INSERT INTO transactions (tran_id, tran_type_cd, tran_cat_cd, source, description, amount, merchant_id, merchant_name, merchant_city, merchant_zip, card_num, orig_ts, proc_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [tranId, 'PM', 2001, 'BILLPAY', 'Bill payment', body.amount, 100234567, 'UTILITY PAYMENT', 'AUSTIN', '73301', paymentCardNum, now, now]
+      );
     });
-    tx();
-    const acct = db.prepare('SELECT curr_bal FROM accounts WHERE acct_id = ?').get(body.acctId);
+
+    const acct = await sqlOne('SELECT curr_bal FROM accounts WHERE acct_id = ?', [body.acctId]);
     res.json({ paymentTranId: tranId, acctId: body.acctId, newBalance: acct.curr_bal, posted: true });
   } catch (error) {
     next(error);
   }
 });
 
-app.post('/api/v1/reports/transactions', requireAuth, (req, res, next) => {
+app.post('/api/v1/reports/transactions', requireAuth, async (req, res, next) => {
   try {
     const body = parseOrThrow(reportSchema, req.body);
     if (body.confirm !== 'Y') throw apiError('VALIDATION_ERROR', errorCatalog.invalidConfirm, 400, [{ field: 'confirm', message: errorCatalog.invalidConfirm }]);
@@ -797,46 +829,37 @@ app.post('/api/v1/reports/transactions', requireAuth, (req, res, next) => {
 
     let requestId;
     try {
-      const result = db.prepare('INSERT INTO report_requests (requested_by, report_type, start_date, end_date, status, submitted_at) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(req.session.user.userId, body.reportType, effectiveStartDate, effectiveEndDate, 'QUEUED', now.toISOString());
-      requestId = result.lastInsertRowid;
+      const [inserted] = await sqlRun(
+        'INSERT INTO report_requests (requested_by, report_type, start_date, end_date, status, submitted_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING request_id',
+        [req.session.user.userId, body.reportType, effectiveStartDate, effectiveEndDate, 'QUEUED', now.toISOString()]
+      );
+      requestId = Number(inserted.request_id);
     } catch (_dbError) {
       throw apiError('SYSTEM_ERROR', errorCatalog.tdqFailure, 503);
     }
 
     try {
-      const submitted = submitJob({
+      const submitted = await submitJob({
         jobName: 'TRANREPT',
         runMode: 'manual',
-        parameters: {
-          startDate: effectiveStartDate,
-          endDate: effectiveEndDate,
-          reportType: body.reportType,
-          requestId
-        },
+        parameters: { startDate: effectiveStartDate, endDate: effectiveEndDate, reportType: body.reportType, requestId },
         submittedBy: req.session.user.userId,
         correlationId: `report-request-${requestId}`
       });
 
-      db.prepare('UPDATE report_requests SET status = ?, job_run_id = ? WHERE request_id = ?')
-        .run('SUBMITTED', submitted.jobRunId, requestId);
+      await sqlRun(
+        'UPDATE report_requests SET status = ?, job_run_id = ? WHERE request_id = ?',
+        ['SUBMITTED', submitted.jobRunId, requestId]
+      );
 
-      res.status(202).json({
-        requestId,
-        jobRunId: submitted.jobRunId,
-        status: 'SUBMITTED',
-        message: 'Report request submitted to batch runner'
-      });
+      res.status(202).json({ requestId, jobRunId: submitted.jobRunId, status: 'SUBMITTED', message: 'Report request submitted to batch runner' });
     } catch (error) {
-      db.prepare('UPDATE report_requests SET status = ?, error_summary = ?, completed_at = ? WHERE request_id = ?')
-        .run('FAILED', error?.message || 'Batch submission failed', new Date().toISOString(), requestId);
-
-      if (error?.code === 'JOB_ALREADY_RUNNING') {
-        throw apiError('CONFLICT', error.message, 409, [{ field: 'jobName', message: error.message }]);
-      }
-      if (error?.statusCode) {
-        throw error;
-      }
+      await sqlRun(
+        'UPDATE report_requests SET status = ?, error_summary = ?, completed_at = ? WHERE request_id = ?',
+        ['FAILED', error?.message || 'Batch submission failed', new Date().toISOString(), requestId]
+      );
+      if (error?.code === 'JOB_ALREADY_RUNNING') throw apiError('CONFLICT', error.message, 409, [{ field: 'jobName', message: error.message }]);
+      if (error?.statusCode) throw error;
       throw apiError('SYSTEM_ERROR', errorCatalog.tdqFailure, 503);
     }
   } catch (error) {
@@ -844,207 +867,153 @@ app.post('/api/v1/reports/transactions', requireAuth, (req, res, next) => {
   }
 });
 
-app.get('/api/v1/reports/transactions/requests', requireAuth, (req, res) => {
-  const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 20 });
-  const orderBy = resolveSort(req.query.sort, {
-    submittedAt: 'r.submitted_at',
-    requestId: 'r.request_id'
-  }, 'r.submitted_at DESC');
-  const rows = db.prepare(`
-    SELECT
-      r.request_id as requestId,
-      r.report_type as reportType,
-      r.start_date as startDate,
-      r.end_date as endDate,
-      r.status,
-      r.submitted_at as submittedAt,
-      r.job_run_id as jobRunId,
-      r.completed_at as completedAt,
-      r.error_summary as errorSummary,
-      jr.status as jobStatus,
-      jr.exit_code as jobExitCode,
-      jr.error_summary as jobErrorSummary,
-      jr.ended_at as jobEndedAt
-    FROM report_requests r
-    LEFT JOIN job_runs jr ON jr.job_run_id = r.job_run_id
-    ORDER BY ${orderBy}
-    LIMIT ? OFFSET ?
-  `).all(pageSize, offset);
+app.get('/api/v1/reports/transactions/requests', requireAuth, async (req, res, next) => {
+  try {
+    const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 20 });
+    const orderBy = resolveSort(req.query.sort, {
+      submittedAt: 'r.submitted_at',
+      requestId: 'r.request_id'
+    }, 'r.submitted_at DESC');
 
-  const normalizedRows = rows.map((row) => {
-    let status = row.status;
-    let completedAt = row.completedAt;
-    let errorSummary = row.errorSummary;
+    const rows = await sqlAll(
+      `SELECT
+        r.request_id as "requestId",
+        r.report_type as "reportType",
+        r.start_date as "startDate",
+        r.end_date as "endDate",
+        r.status,
+        r.submitted_at as "submittedAt",
+        r.job_run_id as "jobRunId",
+        r.completed_at as "completedAt",
+        r.error_summary as "errorSummary",
+        jr.status as "jobStatus",
+        jr.exit_code as "jobExitCode",
+        jr.error_summary as "jobErrorSummary",
+        jr.ended_at as "jobEndedAt"
+      FROM report_requests r
+      LEFT JOIN job_runs jr ON jr.job_run_id = r.job_run_id
+      ORDER BY ${orderBy}
+      LIMIT ? OFFSET ?`,
+      [pageSize, offset]
+    );
 
-    if (row.jobStatus) {
-      if (row.jobStatus === 'queued') status = 'QUEUED';
-      else if (row.jobStatus === 'running') status = 'RUNNING';
-      else if (row.jobStatus === 'succeeded') status = 'COMPLETED';
-      else if (row.jobStatus === 'failed') status = 'FAILED';
-      else if (row.jobStatus === 'cancelled') status = 'CANCELLED';
+    const normalizedRows = rows.map((row) => {
+      let status = row.status;
+      let completedAt = row.completedAt;
+      let errorSummary = row.errorSummary;
 
-      if (row.jobEndedAt) {
-        completedAt = row.jobEndedAt;
-      }
-      if (row.jobErrorSummary) {
-        errorSummary = row.jobErrorSummary;
-      }
-    }
-
-    return {
-      requestId: row.requestId,
-      reportType: row.reportType,
-      startDate: row.startDate,
-      endDate: row.endDate,
-      status,
-      submittedAt: row.submittedAt,
-      jobRunId: row.jobRunId,
-      completedAt,
-      errorSummary,
-      jobExitCode: row.jobExitCode
-    };
-  });
-
-  const updateCompletedStmt = db.prepare('UPDATE report_requests SET status = ?, completed_at = COALESCE(completed_at, ?), error_summary = ? WHERE request_id = ?');
-  const updateRunningStmt = db.prepare('UPDATE report_requests SET status = ? WHERE request_id = ?');
-
-  const updateTx = db.transaction(() => {
-    for (const row of normalizedRows) {
-      if (row.status === 'COMPLETED' || row.status === 'FAILED' || row.status === 'CANCELLED') {
-        updateCompletedStmt.run(row.status, row.completedAt || new Date().toISOString(), row.errorSummary || null, row.requestId);
-      } else if (row.status === 'QUEUED' || row.status === 'RUNNING') {
-        updateRunningStmt.run(row.status, row.requestId);
-      }
-    }
-  });
-  updateTx();
-
-  const total = db.prepare('SELECT COUNT(*) as count FROM report_requests').get().count;
-  res.json({ items: normalizedRows, page, pageSize, total });
-});
-
-function registerBatchRoutes(basePath) {
-  app.get(`${basePath}/jobs`, requireRole('A'), (_req, res) => {
-    res.json({ items: getJobs() });
-  });
-
-  app.get(`${basePath}/jobs/capability-matrix`, requireRole('A'), (req, res) => {
-    const previewLimitRaw = Number(req.query.previewChars);
-    const previewChars = Number.isFinite(previewLimitRaw)
-      ? Math.min(500, Math.max(80, Math.floor(previewLimitRaw)))
-      : 160;
-
-    const jobs = getJobs();
-    const items = jobs.map((job) => {
-      const latestRun = db.prepare(`
-        SELECT
-          job_run_id as jobRunId,
-          status,
-          exit_code as exitCode,
-          submitted_at as submittedAt,
-          ended_at as endedAt
-        FROM job_runs
-        WHERE job_name = ?
-        ORDER BY submitted_at DESC
-        LIMIT 1
-      `).get(job.jobName);
-
-      if (!latestRun) {
-        return {
-          jobName: job.jobName,
-          classification: 'unknown',
-          reason: 'No runs found for this job',
-          latestRun: null,
-          artifactTypes: [],
-          previews: []
-        };
-      }
-
-      const artifacts = db.prepare(`
-        SELECT
-          artifact_type as type,
-          name,
-          storage_kind as storageKind,
-          storage_path as storagePath,
-          content_inline as contentInline,
-          size_bytes as sizeBytes
-        FROM artifacts
-        WHERE job_run_id = ?
-        ORDER BY created_at DESC
-      `).all(latestRun.jobRunId);
-
-      const artifactTypes = [...new Set(artifacts.map((artifact) => artifact.type))];
-      const reportOrExtractArtifacts = artifacts
-        .filter((artifact) => artifact.type === 'report' || artifact.type === 'extract')
-        .slice(0, 2);
-
-      const previews = reportOrExtractArtifacts.map((artifact) => {
-        let preview = null;
-        if (artifact.storageKind === 'inline' && typeof artifact.contentInline === 'string') {
-          preview = artifact.contentInline.replace(/\s+/g, ' ').slice(0, previewChars);
-        } else if (artifact.storageKind === 'file' && artifact.storagePath && fs.existsSync(artifact.storagePath)) {
-          const content = fs.readFileSync(artifact.storagePath, 'utf8');
-          preview = content.replace(/\s+/g, ' ').slice(0, previewChars);
-        }
-        return {
-          name: artifact.name,
-          type: artifact.type,
-          sizeBytes: artifact.sizeBytes,
-          preview
-        };
-      });
-
-      const hasRichArtifacts = artifactTypes.includes('report') || artifactTypes.includes('extract');
-      const hasMeaningfulPreview = previews.some((item) => {
-        const text = (item.preview || '').toLowerCase();
-        return text.length > 20 && !text.includes('simulated') && !text.includes('placeholder');
-      });
-
-      let classification = 'mixed';
-      let reason = 'Run has partial evidence of real artifacts';
-      if (latestRun.status !== 'succeeded') {
-        classification = 'needs-attention';
-        reason = `Latest run status is ${latestRun.status}`;
-      } else if (!hasRichArtifacts) {
-        classification = 'simulated/log-only';
-        reason = 'No report or extract artifacts detected';
-      } else if (hasMeaningfulPreview) {
-        classification = 'real-worker';
-        reason = 'Report or extract artifacts contain non-placeholder content';
+      if (row.jobStatus) {
+        if (row.jobStatus === 'queued') status = 'QUEUED';
+        else if (row.jobStatus === 'running') status = 'RUNNING';
+        else if (row.jobStatus === 'succeeded') status = 'COMPLETED';
+        else if (row.jobStatus === 'failed') status = 'FAILED';
+        else if (row.jobStatus === 'cancelled') status = 'CANCELLED';
+        if (row.jobEndedAt) completedAt = row.jobEndedAt;
+        if (row.jobErrorSummary) errorSummary = row.jobErrorSummary;
       }
 
       return {
-        jobName: job.jobName,
-        classification,
-        reason,
-        latestRun,
-        artifactTypes,
-        previews
+        requestId: row.requestId, reportType: row.reportType, startDate: row.startDate,
+        endDate: row.endDate, status, submittedAt: row.submittedAt, jobRunId: row.jobRunId,
+        completedAt, errorSummary, jobExitCode: row.jobExitCode
       };
     });
 
-    const summary = items.reduce((acc, item) => {
-      acc[item.classification] = (acc[item.classification] || 0) + 1;
-      return acc;
-    }, {});
-
-    res.json({
-      generatedAt: new Date().toISOString(),
-      basedOn: 'latest-run-per-job',
-      items,
-      summary
+    await sqlTx(async ({ txRun }) => {
+      for (const row of normalizedRows) {
+        if (row.status === 'COMPLETED' || row.status === 'FAILED' || row.status === 'CANCELLED') {
+          await txRun(
+            'UPDATE report_requests SET status = ?, completed_at = COALESCE(completed_at, ?), error_summary = ? WHERE request_id = ?',
+            [row.status, row.completedAt || new Date().toISOString(), row.errorSummary || null, row.requestId]
+          );
+        } else if (row.status === 'QUEUED' || row.status === 'RUNNING') {
+          await txRun('UPDATE report_requests SET status = ? WHERE request_id = ?', [row.status, row.requestId]);
+        }
+      }
     });
+
+    const totalRow = await sqlOne('SELECT COUNT(*) as count FROM report_requests', []);
+    res.json({ items: normalizedRows, page, pageSize, total: Number(totalRow.count) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+function registerBatchRoutes(basePath) {
+  app.get(`${basePath}/jobs`, requireRole('A'), async (_req, res, next) => {
+    try {
+      res.json({ items: await getJobs() });
+    } catch (error) {
+      next(error);
+    }
   });
 
-  app.post(`${basePath}/jobs/:jobName/submit`, requireRole('A'), (req, res, next) => {
+  app.get(`${basePath}/jobs/capability-matrix`, requireRole('A'), async (req, res, next) => {
     try {
-      const row = db.prepare('SELECT job_name, enabled FROM jobs WHERE job_name = ?').get(req.params.jobName);
-      if (!row) {
-        throw apiError('NOT_FOUND', 'Unknown batch job', 404, [{ field: 'jobName', message: 'Unknown batch job' }]);
-      }
-      if (Number(row.enabled) !== 1) {
-        throw apiError('VALIDATION_ERROR', 'Batch job is disabled', 400, [{ field: 'jobName', message: 'Batch job is disabled' }]);
-      }
+      const previewLimitRaw = Number(req.query.previewChars);
+      const previewChars = Number.isFinite(previewLimitRaw)
+        ? Math.min(500, Math.max(80, Math.floor(previewLimitRaw)))
+        : 160;
+
+      const jobs = await getJobs();
+      const items = await Promise.all(jobs.map(async (job) => {
+        const latestRun = await sqlOne(
+          `SELECT job_run_id as "jobRunId", status, exit_code as "exitCode", submitted_at as "submittedAt", ended_at as "endedAt"
+           FROM job_runs WHERE job_name = ? ORDER BY submitted_at DESC LIMIT 1`,
+          [job.jobName]
+        );
+
+        if (!latestRun) {
+          return { jobName: job.jobName, classification: 'unknown', reason: 'No runs found for this job', latestRun: null, artifactTypes: [], previews: [] };
+        }
+
+        const artifacts = await sqlAll(
+          `SELECT artifact_type as type, name, storage_kind as "storageKind", storage_path as "storagePath", content_inline as "contentInline", size_bytes as "sizeBytes"
+           FROM artifacts WHERE job_run_id = ? ORDER BY created_at DESC`,
+          [latestRun.jobRunId]
+        );
+
+        const artifactTypes = [...new Set(artifacts.map((a) => a.type))];
+        const reportOrExtractArtifacts = artifacts.filter((a) => a.type === 'report' || a.type === 'extract').slice(0, 2);
+
+        const previews = reportOrExtractArtifacts.map((artifact) => {
+          let preview = null;
+          if (artifact.storageKind === 'inline' && typeof artifact.contentInline === 'string') {
+            preview = artifact.contentInline.replace(/\s+/g, ' ').slice(0, previewChars);
+          } else if (artifact.storageKind === 'file' && artifact.storagePath && fs.existsSync(artifact.storagePath)) {
+            const content = fs.readFileSync(artifact.storagePath, 'utf8');
+            preview = content.replace(/\s+/g, ' ').slice(0, previewChars);
+          }
+          return { name: artifact.name, type: artifact.type, sizeBytes: artifact.sizeBytes, preview };
+        });
+
+        const hasRichArtifacts = artifactTypes.includes('report') || artifactTypes.includes('extract');
+        const hasMeaningfulPreview = previews.some((item) => {
+          const text = (item.preview || '').toLowerCase();
+          return text.length > 20 && !text.includes('simulated') && !text.includes('placeholder');
+        });
+
+        let classification = 'mixed';
+        let reason = 'Run has partial evidence of real artifacts';
+        if (latestRun.status !== 'succeeded') { classification = 'needs-attention'; reason = `Latest run status is ${latestRun.status}`; }
+        else if (!hasRichArtifacts) { classification = 'simulated/log-only'; reason = 'No report or extract artifacts detected'; }
+        else if (hasMeaningfulPreview) { classification = 'real-worker'; reason = 'Report or extract artifacts contain non-placeholder content'; }
+
+        return { jobName: job.jobName, classification, reason, latestRun, artifactTypes, previews };
+      }));
+
+      const summary = items.reduce((acc, item) => { acc[item.classification] = (acc[item.classification] || 0) + 1; return acc; }, {});
+      res.json({ generatedAt: new Date().toISOString(), basedOn: 'latest-run-per-job', items, summary });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post(`${basePath}/jobs/:jobName/submit`, requireRole('A'), async (req, res, next) => {
+    try {
+      const row = await sqlOne('SELECT job_name, enabled FROM jobs WHERE job_name = ?', [req.params.jobName]);
+      if (!row) throw apiError('NOT_FOUND', 'Unknown batch job', 404, [{ field: 'jobName', message: 'Unknown batch job' }]);
+      if (Number(row.enabled) !== 1) throw apiError('VALIDATION_ERROR', 'Batch job is disabled', 400, [{ field: 'jobName', message: 'Batch job is disabled' }]);
 
       const runMode = req.body?.runMode ? String(req.body.runMode) : 'manual';
       if (!['manual', 'scheduled', 'replay'].includes(runMode)) {
@@ -1061,329 +1030,234 @@ function registerBatchRoutes(basePath) {
         }
       }
 
-      const result = submitJob({
-        jobName: req.params.jobName,
-        runMode,
-        parameters,
+      const result = await submitJob({
+        jobName: req.params.jobName, runMode, parameters,
         submittedBy: req.session.user?.userId,
         correlationId: req.correlationId
       });
 
-      if (!result) {
-        throw apiError('NOT_FOUND', 'Unknown batch job', 404, [{ field: 'jobName', message: 'Unknown batch job' }]);
-      }
-
+      if (!result) throw apiError('NOT_FOUND', 'Unknown batch job', 404, [{ field: 'jobName', message: 'Unknown batch job' }]);
       res.status(202).json(result);
     } catch (error) {
-      if (error.code === 'JOB_ALREADY_RUNNING') {
-        return next(apiError('CONFLICT', error.message, 409, [{ field: 'jobName', message: error.message }]));
-      }
+      if (error.code === 'JOB_ALREADY_RUNNING') return next(apiError('CONFLICT', error.message, 409, [{ field: 'jobName', message: error.message }]));
       next(error);
     }
   });
 
-  app.get(`${basePath}/job-runs`, requireRole('A'), (req, res) => {
-    const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 20 });
-    const whereParts = [];
-    const params = [];
+  app.get(`${basePath}/job-runs`, requireRole('A'), async (req, res, next) => {
+    try {
+      const { page, pageSize, offset } = listQuery(req, { page: 1, pageSize: 20 });
+      const whereParts = [];
+      const params = [];
 
-    if (req.query.jobName) {
-      whereParts.push('r.job_name = ?');
-      params.push(String(req.query.jobName));
-    }
+      if (req.query.jobName) { whereParts.push('r.job_name = ?'); params.push(String(req.query.jobName)); }
+      if (req.query.status) { whereParts.push('r.status = ?'); params.push(String(req.query.status)); }
 
-    if (req.query.status) {
-      whereParts.push('r.status = ?');
-      params.push(String(req.query.status));
-    }
+      const from = req.query.from ? parseStrictIsoDate(String(req.query.from)) : null;
+      const to = req.query.to ? parseStrictIsoDate(String(req.query.to)) : null;
+      if (from) { whereParts.push('r.submitted_at::DATE >= ?'); params.push(String(req.query.from)); }
+      if (to) { whereParts.push('r.submitted_at::DATE <= ?'); params.push(String(req.query.to)); }
 
-    const from = req.query.from ? parseStrictIsoDate(String(req.query.from)) : null;
-    const to = req.query.to ? parseStrictIsoDate(String(req.query.to)) : null;
-    if (from) {
-      whereParts.push('DATE(r.submitted_at) >= ?');
-      params.push(String(req.query.from));
-    }
-    if (to) {
-      whereParts.push('DATE(r.submitted_at) <= ?');
-      params.push(String(req.query.to));
-    }
+      const hasRetryPolicyFilter = req.query.hasRetryPolicy === 'true' ? true : req.query.hasRetryPolicy === 'false' ? false : null;
+      const minMaxAttemptsRaw = req.query.minMaxAttempts !== undefined ? Number(req.query.minMaxAttempts) : null;
+      const minMaxAttempts = Number.isFinite(minMaxAttemptsRaw) && minMaxAttemptsRaw > 0 ? Math.floor(minMaxAttemptsRaw) : null;
 
-    const hasRetryPolicyRaw = req.query.hasRetryPolicy;
-    const hasRetryPolicyFilter = hasRetryPolicyRaw === 'true' ? true : hasRetryPolicyRaw === 'false' ? false : null;
-    const minMaxAttemptsRaw = req.query.minMaxAttempts !== undefined ? Number(req.query.minMaxAttempts) : null;
-    const minMaxAttempts = Number.isFinite(minMaxAttemptsRaw) && minMaxAttemptsRaw > 0 ? Math.floor(minMaxAttemptsRaw) : null;
+      const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+      const rows = await sqlAll(
+        `SELECT
+          r.job_run_id as "jobRunId", r.job_name as "jobName", r.status,
+          r.submitted_at as "submittedAt", r.started_at as "startedAt", r.ended_at as "endedAt",
+          r.exit_code as "exitCode", r.submitted_by as "submittedBy", r.run_mode as "runMode",
+          r.cancel_requested_at as "cancelRequestedAt", r.cancel_requested_by as "cancelRequestedBy",
+          r.cancel_reason as "cancelReason", j.job_definition_json as "jobDefinitionJson"
+        FROM job_runs r
+        LEFT JOIN jobs j ON j.job_name = r.job_name
+        ${whereClause}
+        ORDER BY r.submitted_at DESC`,
+        params
+      );
 
-    const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
-    const rows = db.prepare(`
-      SELECT
-        r.job_run_id as jobRunId,
-        r.job_name as jobName,
-        r.status as status,
-        r.submitted_at as submittedAt,
-        r.started_at as startedAt,
-        r.ended_at as endedAt,
-        r.exit_code as exitCode,
-        r.submitted_by as submittedBy,
-        r.run_mode as runMode,
-        r.cancel_requested_at as cancelRequestedAt,
-        r.cancel_requested_by as cancelRequestedBy,
-        r.cancel_reason as cancelReason,
-        j.job_definition_json as jobDefinitionJson
-      FROM job_runs r
-      LEFT JOIN jobs j ON j.job_name = r.job_name
-      ${whereClause}
-      ORDER BY r.submitted_at DESC
-    `).all(...params);
-
-    const items = rows.map((row) => {
-      let retryPolicySummary = 'n/a';
-      let retryPolicyDetail = 'No step retry policy found';
-      let hasRetryPolicy = false;
-      let maxStepAttempts = 1;
-      if (row.jobDefinitionJson) {
-        try {
-          const definition = JSON.parse(row.jobDefinitionJson);
-          const steps = Array.isArray(definition.steps) ? definition.steps : [];
-          const retryParts = steps.map((step) => {
-            const maxAttempts = Number.isFinite(Number(step?.retry?.maxAttempts)) ? Number(step.retry.maxAttempts) : 1;
-            const backoffMs = Number.isFinite(Number(step?.retry?.backoffMs)) ? Number(step.retry.backoffMs) : 0;
-            if (step?.retry) hasRetryPolicy = true;
-            maxStepAttempts = Math.max(maxStepAttempts, maxAttempts);
-            return `${step?.name || 'STEP'}: ${maxAttempts}x/${backoffMs}ms`;
-          });
-          if (retryParts.length > 0) {
-            retryPolicySummary = retryParts.join(' | ');
-            retryPolicyDetail = retryParts.join('\n');
+      const items = rows.map((row) => {
+        let retryPolicySummary = 'n/a';
+        let retryPolicyDetail = 'No step retry policy found';
+        let hasRetryPolicy = false;
+        let maxStepAttempts = 1;
+        if (row.jobDefinitionJson) {
+          try {
+            const definition = JSON.parse(row.jobDefinitionJson);
+            const steps = Array.isArray(definition.steps) ? definition.steps : [];
+            const retryParts = steps.map((step) => {
+              const maxAttempts = Number.isFinite(Number(step?.retry?.maxAttempts)) ? Number(step.retry.maxAttempts) : 1;
+              const backoffMs = Number.isFinite(Number(step?.retry?.backoffMs)) ? Number(step.retry.backoffMs) : 0;
+              if (step?.retry) hasRetryPolicy = true;
+              maxStepAttempts = Math.max(maxStepAttempts, maxAttempts);
+              return `${step?.name || 'STEP'}: ${maxAttempts}x/${backoffMs}ms`;
+            });
+            if (retryParts.length > 0) { retryPolicySummary = retryParts.join(' | '); retryPolicyDetail = retryParts.join('\n'); }
+          } catch (_error) {
+            retryPolicySummary = 'invalid policy';
+            retryPolicyDetail = 'Unable to parse job retry policy definition';
           }
-        } catch (_error) {
-          retryPolicySummary = 'invalid policy';
-          retryPolicyDetail = 'Unable to parse job retry policy definition';
         }
-      }
+        return { ...row, retryPolicySummary, retryPolicyDetail, hasRetryPolicy, maxStepAttempts };
+      });
 
-      return {
-        ...row,
-        retryPolicySummary,
-        retryPolicyDetail,
-        hasRetryPolicy,
-        maxStepAttempts
-      };
-    });
+      const filteredItems = items.filter((item) => {
+        if (hasRetryPolicyFilter !== null && item.hasRetryPolicy !== hasRetryPolicyFilter) return false;
+        if (minMaxAttempts !== null && Number(item.maxStepAttempts || 1) < minMaxAttempts) return false;
+        return true;
+      });
 
-    const filteredItems = items.filter((item) => {
-      if (hasRetryPolicyFilter !== null && item.hasRetryPolicy !== hasRetryPolicyFilter) {
-        return false;
-      }
-      if (minMaxAttempts !== null && Number(item.maxStepAttempts || 1) < minMaxAttempts) {
-        return false;
-      }
-      return true;
-    });
-
-    const pagedItems = filteredItems.slice(offset, offset + pageSize);
-    const total = filteredItems.length;
-
-    res.json({ items: pagedItems, page, pageSize, total });
-  });
-
-  app.get(`${basePath}/job-runs/:jobRunId`, requireRole('A'), (req, res, next) => {
-    const run = db.prepare(`
-      SELECT
-        job_run_id as jobRunId,
-        job_name as jobName,
-        status,
-        submitted_at as submittedAt,
-        started_at as startedAt,
-        ended_at as endedAt,
-        run_mode as runMode,
-        parameters_json as parametersJson,
-        exit_code as exitCode,
-        error_summary as errorSummary,
-        restart_of_job_run_id as restartOfJobRunId,
-        cancel_requested_at as cancelRequestedAt,
-        cancel_requested_by as cancelRequestedBy,
-        cancel_reason as cancelReason
-      FROM job_runs
-      WHERE job_run_id = ?
-    `).get(req.params.jobRunId);
-
-    if (!run) {
-      return next(apiError('NOT_FOUND', 'Batch run not found', 404, [{ field: 'jobRunId', message: 'Unknown job run id' }]));
+      const pagedItems = filteredItems.slice(offset, offset + pageSize);
+      res.json({ items: pagedItems, page, pageSize, total: filteredItems.length });
+    } catch (error) {
+      next(error);
     }
-
-    const steps = db.prepare(`
-      SELECT
-        step_run_id as stepRunId,
-        step_seq as stepSeq,
-        step_name as stepName,
-        legacy_exec_target as target,
-        status,
-        return_code as returnCode,
-        started_at as startedAt,
-        ended_at as endedAt,
-        message
-      FROM job_run_steps
-      WHERE job_run_id = ?
-      ORDER BY step_seq ASC
-    `).all(req.params.jobRunId);
-
-    const jobDefRow = db.prepare('SELECT job_definition_json as jobDefinitionJson FROM jobs WHERE job_name = ?').get(run.jobName);
-    const definitionSteps = jobDefRow?.jobDefinitionJson ? (JSON.parse(jobDefRow.jobDefinitionJson).steps || []) : [];
-    const stepsWithRetry = steps.map((step) => {
-      const def = definitionSteps[Number(step.stepSeq) - 1] || {};
-      const retry = def.retry || {};
-      const retryMaxAttempts = Number.isFinite(Number(retry.maxAttempts)) ? Number(retry.maxAttempts) : 1;
-      const retryBackoffMs = Number.isFinite(Number(retry.backoffMs)) ? Number(retry.backoffMs) : 0;
-      return {
-        ...step,
-        retryMaxAttempts,
-        retryBackoffMs
-      };
-    });
-
-    res.json({
-      ...run,
-      parameters: run.parametersJson ? JSON.parse(run.parametersJson) : {},
-      steps: stepsWithRetry
-    });
   });
 
-  app.post(`${basePath}/job-runs/:jobRunId/restart`, requireRole('A'), (req, res, next) => {
+  app.get(`${basePath}/job-runs/:jobRunId`, requireRole('A'), async (req, res, next) => {
+    try {
+      const run = await sqlOne(
+        `SELECT job_run_id as "jobRunId", job_name as "jobName", status,
+          submitted_at as "submittedAt", started_at as "startedAt", ended_at as "endedAt",
+          run_mode as "runMode", parameters_json as "parametersJson", exit_code as "exitCode",
+          error_summary as "errorSummary", restart_of_job_run_id as "restartOfJobRunId",
+          cancel_requested_at as "cancelRequestedAt", cancel_requested_by as "cancelRequestedBy",
+          cancel_reason as "cancelReason"
+        FROM job_runs WHERE job_run_id = ?`,
+        [req.params.jobRunId]
+      );
+      if (!run) return next(apiError('NOT_FOUND', 'Batch run not found', 404, [{ field: 'jobRunId', message: 'Unknown job run id' }]));
+
+      const steps = await sqlAll(
+        `SELECT step_run_id as "stepRunId", step_seq as "stepSeq", step_name as "stepName",
+          legacy_exec_target as target, status, return_code as "returnCode",
+          started_at as "startedAt", ended_at as "endedAt", message
+        FROM job_run_steps WHERE job_run_id = ? ORDER BY step_seq ASC`,
+        [req.params.jobRunId]
+      );
+
+      const jobDefRow = await sqlOne('SELECT job_definition_json as "jobDefinitionJson" FROM jobs WHERE job_name = ?', [run.jobName]);
+      const definitionSteps = jobDefRow?.jobDefinitionJson ? (JSON.parse(jobDefRow.jobDefinitionJson).steps || []) : [];
+      const stepsWithRetry = steps.map((step) => {
+        const def = definitionSteps[Number(step.stepSeq) - 1] || {};
+        const retry = def.retry || {};
+        return {
+          ...step,
+          retryMaxAttempts: Number.isFinite(Number(retry.maxAttempts)) ? Number(retry.maxAttempts) : 1,
+          retryBackoffMs: Number.isFinite(Number(retry.backoffMs)) ? Number(retry.backoffMs) : 0
+        };
+      });
+
+      res.json({ ...run, parameters: run.parametersJson ? JSON.parse(run.parametersJson) : {}, steps: stepsWithRetry });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post(`${basePath}/job-runs/:jobRunId/restart`, requireRole('A'), async (req, res, next) => {
     try {
       const restartMode = req.body?.mode ? String(req.body.mode) : 'resume-from-failed-step';
       if (!['resume-from-failed-step', 'rerun-all'].includes(restartMode)) {
         throw apiError('VALIDATION_ERROR', 'Input validation failed', 400, [{ field: 'mode', message: 'mode must be resume-from-failed-step or rerun-all' }]);
       }
 
-      const result = restartJobRun({
-        priorJobRunId: req.params.jobRunId,
-        restartMode,
+      const result = await restartJobRun({
+        priorJobRunId: req.params.jobRunId, restartMode,
         submittedBy: req.session.user?.userId,
         correlationId: req.correlationId
       });
 
-      if (!result) {
-        throw apiError('NOT_FOUND', 'Batch run not found', 404, [{ field: 'jobRunId', message: 'Unknown job run id' }]);
-      }
-
+      if (!result) throw apiError('NOT_FOUND', 'Batch run not found', 404, [{ field: 'jobRunId', message: 'Unknown job run id' }]);
       res.status(202).json({ ...result, restartMode, restartOfJobRunId: req.params.jobRunId });
     } catch (error) {
-      if (error.code === 'JOB_ALREADY_RUNNING') {
-        return next(apiError('CONFLICT', error.message, 409, [{ field: 'jobName', message: error.message }]));
-      }
-      if (error.code === 'INVALID_RESTART_STATE') {
-        return next(apiError('VALIDATION_ERROR', error.message, 400, [{ field: 'jobRunId', message: error.message }]));
-      }
+      if (error.code === 'JOB_ALREADY_RUNNING') return next(apiError('CONFLICT', error.message, 409, [{ field: 'jobName', message: error.message }]));
+      if (error.code === 'INVALID_RESTART_STATE') return next(apiError('VALIDATION_ERROR', error.message, 400, [{ field: 'jobRunId', message: error.message }]));
       next(error);
     }
   });
 
-  app.post(`${basePath}/job-runs/:jobRunId/cancel`, requireRole('A'), (req, res, next) => {
+  app.post(`${basePath}/job-runs/:jobRunId/cancel`, requireRole('A'), async (req, res, next) => {
     try {
       const reason = req.body?.reason ? String(req.body.reason) : 'Cancelled by user request';
-      const result = cancelJobRun({
-        jobRunId: req.params.jobRunId,
-        requestedBy: req.session.user?.userId,
-        reason
-      });
-
-      if (!result) {
-        throw apiError('NOT_FOUND', 'Batch run not found', 404, [{ field: 'jobRunId', message: 'Unknown job run id' }]);
-      }
-
+      const result = await cancelJobRun({ jobRunId: req.params.jobRunId, requestedBy: req.session.user?.userId, reason });
+      if (!result) throw apiError('NOT_FOUND', 'Batch run not found', 404, [{ field: 'jobRunId', message: 'Unknown job run id' }]);
       res.status(202).json(result);
     } catch (error) {
-      if (error.code === 'RUN_COMPLETED') {
-        return next(apiError('VALIDATION_ERROR', error.message, 400, [{ field: 'jobRunId', message: error.message }]));
-      }
+      if (error.code === 'RUN_COMPLETED') return next(apiError('VALIDATION_ERROR', error.message, 400, [{ field: 'jobRunId', message: error.message }]));
       next(error);
     }
   });
 
-  app.get(`${basePath}/job-runs/:jobRunId/logs`, requireRole('A'), (req, res, next) => {
-    const run = db.prepare('SELECT job_run_id FROM job_runs WHERE job_run_id = ?').get(req.params.jobRunId);
-    if (!run) {
-      return next(apiError('NOT_FOUND', 'Batch run not found', 404, [{ field: 'jobRunId', message: 'Unknown job run id' }]));
+  app.get(`${basePath}/job-runs/:jobRunId/logs`, requireRole('A'), async (req, res, next) => {
+    try {
+      const run = await sqlOne('SELECT job_run_id FROM job_runs WHERE job_run_id = ?', [req.params.jobRunId]);
+      if (!run) return next(apiError('NOT_FOUND', 'Batch run not found', 404, [{ field: 'jobRunId', message: 'Unknown job run id' }]));
+
+      const inlineLog = await sqlOne(
+        `SELECT content_inline as "contentInline" FROM artifacts
+         WHERE job_run_id = ? AND artifact_type = 'log' AND name = 'job.log' AND storage_kind = 'inline'
+         ORDER BY created_at DESC LIMIT 1`,
+        [req.params.jobRunId]
+      );
+
+      if (inlineLog?.contentInline) {
+        return res.json({ jobRunId: req.params.jobRunId, combinedLog: inlineLog.contentInline, truncated: false });
+      }
+
+      const stepLogs = await sqlAll(
+        `SELECT step_seq as "stepSeq", step_name as "stepName", message, return_code as "returnCode"
+         FROM job_run_steps WHERE job_run_id = ? ORDER BY step_seq ASC`,
+        [req.params.jobRunId]
+      );
+
+      const combinedLog = stepLogs
+        .map((row) => `STEP ${row.stepSeq} ${row.stepName} RC=${row.returnCode ?? 'N/A'} ${row.message || ''}`)
+        .join('\n');
+      res.json({ jobRunId: req.params.jobRunId, combinedLog, truncated: false });
+    } catch (error) {
+      next(error);
     }
-
-    const inlineLog = db.prepare(`
-      SELECT content_inline as contentInline
-      FROM artifacts
-      WHERE job_run_id = ? AND artifact_type = 'log' AND name = 'job.log' AND storage_kind = 'inline'
-      ORDER BY created_at DESC
-      LIMIT 1
-    `).get(req.params.jobRunId);
-
-    if (inlineLog?.contentInline) {
-      return res.json({ jobRunId: req.params.jobRunId, combinedLog: inlineLog.contentInline, truncated: false });
-    }
-
-    const stepLogs = db.prepare(`
-      SELECT step_seq as stepSeq, step_name as stepName, message, return_code as returnCode
-      FROM job_run_steps
-      WHERE job_run_id = ?
-      ORDER BY step_seq ASC
-    `).all(req.params.jobRunId);
-
-    const combinedLog = stepLogs
-      .map((row) => `STEP ${row.stepSeq} ${row.stepName} RC=${row.returnCode ?? 'N/A'} ${row.message || ''}`)
-      .join('\n');
-
-    res.json({ jobRunId: req.params.jobRunId, combinedLog, truncated: false });
   });
 
-  app.get(`${basePath}/job-runs/:jobRunId/artifacts`, requireRole('A'), (req, res, next) => {
-    const run = db.prepare('SELECT job_run_id FROM job_runs WHERE job_run_id = ?').get(req.params.jobRunId);
-    if (!run) {
-      return next(apiError('NOT_FOUND', 'Batch run not found', 404, [{ field: 'jobRunId', message: 'Unknown job run id' }]));
+  app.get(`${basePath}/job-runs/:jobRunId/artifacts`, requireRole('A'), async (req, res, next) => {
+    try {
+      const run = await sqlOne('SELECT job_run_id FROM job_runs WHERE job_run_id = ?', [req.params.jobRunId]);
+      if (!run) return next(apiError('NOT_FOUND', 'Batch run not found', 404, [{ field: 'jobRunId', message: 'Unknown job run id' }]));
+
+      const items = await sqlAll(
+        `SELECT artifact_id as "artifactId", name, artifact_type as type, mime_type as "mimeType",
+          size_bytes as "sizeBytes", created_at as "createdAt", storage_kind as "storageKind"
+         FROM artifacts WHERE job_run_id = ? ORDER BY created_at DESC`,
+        [req.params.jobRunId]
+      );
+      res.json({ items });
+    } catch (error) {
+      next(error);
     }
-
-    const items = db.prepare(`
-      SELECT
-        artifact_id as artifactId,
-        name,
-        artifact_type as type,
-        mime_type as mimeType,
-        size_bytes as sizeBytes,
-        created_at as createdAt,
-        storage_kind as storageKind
-      FROM artifacts
-      WHERE job_run_id = ?
-      ORDER BY created_at DESC
-    `).all(req.params.jobRunId);
-
-    res.json({ items });
   });
 
-  app.get(`${basePath}/job-runs/:jobRunId/artifacts/:artifactId`, requireRole('A'), (req, res, next) => {
-    const artifact = db.prepare(`
-      SELECT *
-      FROM artifacts
-      WHERE job_run_id = ? AND artifact_id = ?
-    `).get(req.params.jobRunId, req.params.artifactId);
+  app.get(`${basePath}/job-runs/:jobRunId/artifacts/:artifactId`, requireRole('A'), async (req, res, next) => {
+    try {
+      const artifact = await sqlOne(
+        'SELECT * FROM artifacts WHERE job_run_id = ? AND artifact_id = ?',
+        [req.params.jobRunId, req.params.artifactId]
+      );
+      if (!artifact) return next(apiError('NOT_FOUND', 'Artifact not found', 404, [{ field: 'artifactId', message: 'Unknown artifact id' }]));
 
-    if (!artifact) {
-      return next(apiError('NOT_FOUND', 'Artifact not found', 404, [{ field: 'artifactId', message: 'Unknown artifact id' }]));
-    }
+      res.setHeader('Content-Type', artifact.mime_type || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename="${artifact.name}"`);
 
-    res.setHeader('Content-Type', artifact.mime_type || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${artifact.name}"`);
-
-    if (artifact.storage_kind === 'inline') {
-      return res.send(artifact.content_inline || '');
-    }
-
-    if (artifact.storage_kind === 'file') {
-      if (!artifact.storage_path) {
-        return next(apiError('SYSTEM_ERROR', 'Artifact storage path missing', 410, [{ field: 'storagePath', message: 'Artifact file metadata incomplete' }]));
+      if (artifact.storage_kind === 'inline') return res.send(artifact.content_inline || '');
+      if (artifact.storage_kind === 'file') {
+        if (!artifact.storage_path) return next(apiError('SYSTEM_ERROR', 'Artifact storage path missing', 410, [{ field: 'storagePath', message: 'Artifact file metadata incomplete' }]));
+        if (!fs.existsSync(artifact.storage_path)) return next(apiError('SYSTEM_ERROR', 'Artifact file missing', 410, [{ field: 'storagePath', message: 'Artifact file not found on disk' }]));
+        return res.sendFile(artifact.storage_path);
       }
-      if (!fs.existsSync(artifact.storage_path)) {
-        return next(apiError('SYSTEM_ERROR', 'Artifact file missing', 410, [{ field: 'storagePath', message: 'Artifact file not found on disk' }]));
-      }
-      return res.sendFile(artifact.storage_path);
+      return next(apiError('SYSTEM_ERROR', 'Unsupported artifact storage type', 500));
+    } catch (error) {
+      next(error);
     }
-
-    return next(apiError('SYSTEM_ERROR', 'Unsupported artifact storage type', 500));
   });
 }
 
@@ -1396,4 +1270,9 @@ app.use((error, req, res, _next) => {
   res.status(status).json(errorResponse(error, req.correlationId));
 });
 
-module.exports = { app };
+async function initializeApp() {
+  await migrate();
+  await seed();
+}
+
+module.exports = { app, initializeApp };
