@@ -80,7 +80,11 @@ app.use(session({
   secret: process.env.SESSION_SECRET || 'carddemo-dev-secret',
   resave: false,
   saveUninitialized: false,
-  cookie: { maxAge: 1000 * 60 * 60, sameSite: 'none', secure: process.env.NODE_ENV === 'production' }
+  cookie: {
+    maxAge: 1000 * 60 * 60,
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    secure: process.env.NODE_ENV === 'production'
+  }
 }));
 
 app.get('/api-docs.json', (_req, res) => {

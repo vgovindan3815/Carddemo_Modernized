@@ -1,11 +1,15 @@
-const { neon } = require('@neondatabase/serverless');
+const { neon, Pool, neonConfig } = require('@neondatabase/serverless');
 const bcrypt = require('bcryptjs');
 
 if (!process.env.DATABASE_URL) {
   throw new Error('DATABASE_URL environment variable is required. See .env.example');
 }
 
+// Node 22+ has native WebSocket; use it for Pool (WebSocket-based pg-compatible client).
+neonConfig.webSocketConstructor = globalThis.WebSocket;
+
 const sqlClient = neon(process.env.DATABASE_URL);
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 // Convert ? placeholders to $1, $2, ... (PostgreSQL positional params).
 function toPositional(query) {
@@ -29,16 +33,28 @@ async function sqlRun(query, params = []) {
 }
 
 async function sqlTx(fn) {
-  return await sqlClient.transaction(async (txSql) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
     const helpers = {
-      txRun: (q, p = []) => txSql.query(toPositional(q), p),
+      txRun: async (q, p = []) => {
+        const result = await client.query(toPositional(q), p);
+        return result.rows;
+      },
       txOne: async (q, p = []) => {
-        const rows = await txSql.query(toPositional(q), p);
-        return rows[0] ?? null;
+        const result = await client.query(toPositional(q), p);
+        return result.rows[0] ?? null;
       }
     };
-    return await fn(helpers);
-  });
+    const result = await fn(helpers);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 const defaultBatchJobs = [
