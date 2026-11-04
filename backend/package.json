@@ -4,12 +4,12 @@
   "description": "",
   "main": "src/server.js",
   "scripts": {
-    "dev": "nodemon src/server.js",
-    "start": "node src/server.js",
-    "db:migrate": "node src/db.js migrate",
-    "db:seed": "node src/db.js seed",
-    "db:import-legacy": "node src/import-legacy-data.js",
-    "db:import-legacy:keep": "node src/import-legacy-data.js --keep-existing",
+    "dev": "nodemon --env-file=.env src/server.js",
+    "start": "node --env-file=.env src/server.js",
+    "db:migrate": "node --env-file=.env src/db.js migrate",
+    "db:seed": "node --env-file=.env src/db.js seed",
+    "db:import-legacy": "node --env-file=.env src/import-legacy-data.js",
+    "db:import-legacy:keep": "node --env-file=.env src/import-legacy-data.js --keep-existing",
     "test": "echo \"No tests configured\""
   },
   "keywords": [],

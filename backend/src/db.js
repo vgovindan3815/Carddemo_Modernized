@@ -7,29 +7,35 @@ if (!process.env.DATABASE_URL) {
 
 const sqlClient = neon(process.env.DATABASE_URL);
 
+// Convert ? placeholders to $1, $2, ... (PostgreSQL positional params).
 function toPositional(query) {
   let i = 0;
   return query.replace(/\?/g, () => `$${++i}`);
 }
 
+// Execute via sql.query() which accepts $N positional params (neon v1.x API).
+// Returns { rows, rowCount } — we always expose just rows[].
 async function sqlOne(query, params = []) {
-  const rows = await sqlClient.unsafe(toPositional(query), params);
+  const rows = await sqlClient.query(toPositional(query), params);
   return rows[0] ?? null;
 }
 
 async function sqlAll(query, params = []) {
-  return await sqlClient.unsafe(toPositional(query), params);
+  return await sqlClient.query(toPositional(query), params);
 }
 
 async function sqlRun(query, params = []) {
-  return await sqlClient.unsafe(toPositional(query), params);
+  return await sqlClient.query(toPositional(query), params);
 }
 
 async function sqlTx(fn) {
   return await sqlClient.transaction(async (txSql) => {
     const helpers = {
-      txRun: (q, p = []) => txSql.unsafe(toPositional(q), p),
-      txOne: (q, p = []) => txSql.unsafe(toPositional(q), p).then((r) => r[0] ?? null)
+      txRun: (q, p = []) => txSql.query(toPositional(q), p),
+      txOne: async (q, p = []) => {
+        const rows = await txSql.query(toPositional(q), p);
+        return rows[0] ?? null;
+      }
     };
     return await fn(helpers);
   });
@@ -469,7 +475,7 @@ async function migrate() {
   ];
 
   for (const stmt of stmts) {
-    await sqlClient.unsafe(stmt);
+    await sqlClient.query(stmt);
   }
 }
 
@@ -546,7 +552,7 @@ async function seed() {
 
   const authBase = [
     10000000001, today, timeNow, today, timeNow,
-    '4444333322221111', 'PURCH', '2028-01', 'REQAUT', 'POS', null, '001000'
+    '4444333322221111', 'PURCH', '2028-01', 'REQAUT', 'POS'
   ];
 
   await sqlRun(
